@@ -19,6 +19,7 @@ jobs:
 
       - name: Checkout target repo
         uses: actions/checkout@v6
+        # 使用PAT来提高权限，同步工作流下的文件
         with:
           token: ${{ secrets.UPDATESTREAM_SYNC_TOKEN }}
 
