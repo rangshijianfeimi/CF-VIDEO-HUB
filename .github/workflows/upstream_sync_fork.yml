@@ -6,7 +6,7 @@ permissions:
 
 on:
   schedule:
-    - cron: "0 0 * * *" # every day
+    - cron: "0 0 * * *"
   workflow_dispatch:
 
 jobs:
@@ -16,11 +16,12 @@ jobs:
     if: ${{ github.event.repository.fork }}
 
     steps:
-      # Step 1: checkout target repo
+
       - name: Checkout target repo
         uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.UPDATESTREAM_SYNC_TOKEN }}
 
-      # Step 2: check token
       - name: Check sync token
         run: |
           if [ -z "${{ secrets.UPDATESTREAM_SYNC_TOKEN }}" ]; then
@@ -30,24 +31,21 @@ jobs:
             echo "UPDATESTREAM_SYNC_TOKEN exists"
           fi
 
-      # Step 3: sync upstream changes
       - name: Sync upstream changes
         id: sync
         uses: aormsby/fork-sync-with-upstream-action@v3.4.3
         env:
           GH_TOKEN: ${{ secrets.UPDATESTREAM_SYNC_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.UPDATESTREAM_SYNC_TOKEN }}
         with:
           upstream_sync_repo: fe-spark/EcoHub
           upstream_sync_branch: main
           target_sync_branch: main
           target_repo_token: ${{ secrets.UPDATESTREAM_SYNC_TOKEN }}
-
           test_mode: false
 
-      # Step 4: sync check
       - name: Sync check
         if: failure()
         run: |
-          echo "[Error] 由于上游仓库的 workflow 文件变更，导致 GitHub 自动暂停了本次自动更新"
-          echo "[Error] Due to a change in the workflow file of the upstream repository"
+          echo "Sync failed"
           exit 1
