@@ -3,6 +3,7 @@ package film
 import (
 	"encoding/json"
 	"log"
+	"sort"
 	"strings"
 	"time"
 
@@ -70,9 +71,9 @@ func SaveSitePlayList(sourceID string, list []model.MovieDetail) error {
 		log.Printf("scheduleSearchInfoRefreshByPlaylists Error: %v", err)
 		return err
 	}
-	if err := repository.TouchCollectSourceStatsTx(db.Mdb, sourceID, time.Now()); err != nil {
-		log.Printf("TouchCollectSourceStats Error: %v", err)
-		return err
+	// 仅在有播放源实质变更时更新 last_collect_time。
+	if len(changes) > 0 {
+		repository.NoteCollectSourceStats(sourceID)
 	}
 
 	return nil
@@ -299,6 +300,16 @@ func saveGroupedPlaylists(sourceID string, playlists []model.MoviePlaylist, keys
 			continue
 		}
 		movieKeys = append(movieKeys, movieKey)
+	}
+	sort.Strings(movieKeys)
+
+	if len(playlists) > 0 {
+		sort.Slice(playlists, func(i, j int) bool {
+			if playlists[i].MovieKey == playlists[j].MovieKey {
+				return playlists[i].GroupIndex < playlists[j].GroupIndex
+			}
+			return playlists[i].MovieKey < playlists[j].MovieKey
+		})
 	}
 
 	var changes []playlistChange

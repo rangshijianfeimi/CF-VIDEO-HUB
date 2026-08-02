@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/url"
 	"sort"
 	"strconv"
@@ -32,8 +33,8 @@ import (
 var spiderCore = &JsonCollect{}
 
 const (
-	pageCountRetryTimes   = 2
-	filmDetailRetryTimes  = 2
+	pageCountRetryTimes   = 3
+	filmDetailRetryTimes  = 3
 	collectDBWriteRetries = 3
 	recoverMaxRetryCount  = 5
 )
@@ -78,6 +79,7 @@ var requestGates sync.Map
 type sourceRequestGate struct {
 	mu            sync.Mutex
 	nextAllowedAt time.Time
+	rateLimitHits int
 }
 
 func ClearLimiter(sourceID string) {
@@ -89,6 +91,7 @@ func ClearLimiter(sourceID string) {
 		gate := val.(*sourceRequestGate)
 		gate.mu.Lock()
 		gate.nextAllowedAt = time.Time{}
+		gate.rateLimitHits = 0
 		gate.mu.Unlock()
 	}
 }
@@ -151,7 +154,7 @@ func ensureCollectProgress(sourceID string, name string) *collectProgressState {
 		state.mu.Unlock()
 		return state
 	}
-	state := &collectProgressState{data: model.CollectProgress{Id: sourceID, Name: name, Status: "starting"}, updated: time.Now()}
+	state := &collectProgressState{data: model.CollectProgress{Id: sourceID, Name: name, Status: progressStatusStarting}, updated: time.Now()}
 	actual, _ := collectProgress.LoadOrStore(sourceID, state)
 	return actual.(*collectProgressState)
 }
@@ -177,16 +180,54 @@ func collectProgressSnapshot(sourceID string) (model.CollectProgress, bool) {
 	return model.CollectProgress{}, false
 }
 
+// 采集进度状态机（SourceJob）：
+//
+//	starting → running → page_done → waiting_publish → finalizing → done
+//	                ↘ stopped / failed
+//
+// page_done: 分页拉取+写库已结束（单站即将收尾）
+// waiting_publish: 批量场景下本站已采完，等待整批统一发布
+const (
+	progressStatusStarting        = "starting"
+	progressStatusRunning         = "running"
+	progressStatusPageDone        = "page_done"
+	progressStatusWaitingPublish  = "waiting_publish"
+	progressStatusFinalizing      = "finalizing"
+	progressStatusDone            = "done"
+	progressStatusFailed          = "failed"
+	progressStatusStopped         = "stopped"
+)
+
+func isActiveCollectStatus(status string) bool {
+	switch status {
+	case progressStatusStarting, progressStatusRunning, progressStatusPageDone,
+		progressStatusWaitingPublish, progressStatusFinalizing:
+		return true
+	default:
+		return false
+	}
+}
+
+func canEnterFinalizing(status string) bool {
+	switch status {
+	case progressStatusStarting, progressStatusRunning, progressStatusPageDone,
+		progressStatusWaitingPublish, progressStatusStopped, progressStatusDone:
+		return true
+	default:
+		return false
+	}
+}
+
 func isCollectProgressStopped(sourceID string) bool {
 	if progress, ok := collectProgressSnapshot(sourceID); ok {
-		return progress.Status == "stopped"
+		return progress.Status == progressStatusStopped
 	}
 	return false
 }
 
 func isCollectProgressStarting(sourceID string) bool {
 	if progress, ok := collectProgressSnapshot(sourceID); ok {
-		return progress.Status == "starting"
+		return progress.Status == progressStatusStarting
 	}
 	return false
 }
@@ -195,7 +236,137 @@ func isCollectAlreadyQueuedOrRunning(sourceID string) bool {
 	if _, ok := activeTasks.Load(sourceID); ok {
 		return true
 	}
-	return isCollectProgressStarting(sourceID)
+	// 只检查当前源，避免热路径全表扫；超时活跃状态就地标 failed 以允许重采。
+	if refreshAndIsBlockingSourceProgress(sourceID) {
+		return true
+	}
+	return false
+}
+
+func progressRetainDuration() time.Duration {
+	sec := config.CollectProgressRetainSec
+	if sec <= 0 {
+		sec = config.DefaultCollectProgressRetainSec
+	}
+	return time.Duration(sec) * time.Second
+}
+
+func progressStaleDuration() time.Duration {
+	sec := config.CollectProgressStaleSec
+	if sec <= 0 {
+		sec = config.DefaultCollectProgressStaleSec
+	}
+	return time.Duration(sec) * time.Second
+}
+
+// refreshAndIsBlockingSourceProgress 检查单站是否仍处于不可重入的活跃进度。
+// 若活跃但已超时且无 live task，则标 failed 并返回 false。
+func refreshAndIsBlockingSourceProgress(sourceID string) bool {
+	val, ok := collectProgress.Load(sourceID)
+	if !ok {
+		return false
+	}
+	state := val.(*collectProgressState)
+	now := time.Now()
+	staleAfter := progressStaleDuration()
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if !isActiveCollectStatus(state.data.Status) {
+		return false
+	}
+	_, live := activeTasks.Load(sourceID)
+	if live && (state.data.Status == progressStatusRunning || state.data.Status == progressStatusStarting) {
+		return true
+	}
+	// waiting_publish / finalizing / 无 live task 的 starting|running：看是否超时。
+	age := now.Sub(state.updated)
+	if age >= staleAfter {
+		old := state.data.Status
+		state.data.Status = progressStatusFailed
+		state.updated = now
+		log.Printf("[Spider] 进度超时清理 source=%s status=%s age=%s -> failed",
+			sourceID, old, age.Round(time.Second))
+		// 刚标 failed，不再阻挡重采。
+		return false
+	}
+	return true
+}
+
+// pruneStaleCollectProgress 后台巡检：超时活跃 → failed；过期 done/failed/stopped → 删除。
+func pruneStaleCollectProgress() {
+	now := time.Now()
+	staleAfter := progressStaleDuration()
+	retainFor := progressRetainDuration()
+	collectProgress.Range(func(key, value any) bool {
+		id, _ := key.(string)
+		state := value.(*collectProgressState)
+		state.mu.Lock()
+		status := state.data.Status
+		updated := state.updated
+		age := now.Sub(updated)
+		switch {
+		case isActiveCollectStatus(status):
+			if _, live := activeTasks.Load(id); live && (status == progressStatusRunning || status == progressStatusStarting) {
+				state.mu.Unlock()
+				return true
+			}
+			if age >= staleAfter {
+				state.data.Status = progressStatusFailed
+				state.updated = now
+				log.Printf("[Spider] 进度超时清理 source=%s status=%s age=%s -> failed", id, status, age.Round(time.Second))
+			}
+		case status == progressStatusDone || status == progressStatusFailed || status == progressStatusStopped:
+			if age >= retainFor {
+				state.mu.Unlock()
+				collectProgress.Delete(id)
+				return true
+			}
+		}
+		state.mu.Unlock()
+		return true
+	})
+}
+
+var progressHousekeepingOnce sync.Once
+
+func startCollectProgressHousekeeping() {
+	progressHousekeepingOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				pruneStaleCollectProgress()
+			}
+		}()
+	})
+}
+
+// markSourcePagesFinished 分页阶段结束：单站进入 page_done，批量进入 waiting_publish。
+func markSourcePagesFinished(sourceID string, flushAtEnd bool) {
+	updateCollectProgress(sourceID, func(progress *model.CollectProgress) {
+		if progress.Status != progressStatusRunning && progress.Status != progressStatusStarting {
+			return
+		}
+		if flushAtEnd {
+			progress.Status = progressStatusPageDone
+			return
+		}
+		progress.Status = progressStatusWaitingPublish
+	})
+	// 站点分页结束：强制落盘合并的 stats / 缓存清理。
+	flushCollectHotpathSideEffects(sourceID)
+}
+
+// flushCollectHotpathSideEffects 将采集热路径中合并的 stats 与缓存失效真正执行。
+func flushCollectHotpathSideEffects(sourceIDs ...string) {
+	if len(sourceIDs) == 0 {
+		repository.FlushCollectSourceStats()
+		filmrepo.FlushCollectCacheInvalidations()
+		return
+	}
+	repository.FlushCollectSourceStats(sourceIDs...)
+	filmrepo.FlushCollectCacheInvalidations()
 }
 
 func filterCollectableSources(sources []model.FilmSource, tag string) []model.FilmSource {
@@ -224,18 +395,22 @@ func markSourcesCollectStarting(sources []model.FilmSource) {
 		state.data.Current = 0
 		state.data.Success = 0
 		state.data.Failed = 0
-		state.data.Status = "starting"
+		state.data.Status = progressStatusStarting
 		state.updated = time.Now()
 		state.mu.Unlock()
 	}
 }
 
-func StopTask(sourceID string) {
+func markProgressStopped(sourceID string) {
 	updateCollectProgress(sourceID, func(progress *model.CollectProgress) {
-		if progress.Status == "starting" || progress.Status == "running" {
-			progress.Status = "stopped"
+		if progress.Status == progressStatusStarting || progress.Status == progressStatusRunning {
+			progress.Status = progressStatusStopped
 		}
 	})
+}
+
+func StopTask(sourceID string) {
+	markProgressStopped(sourceID)
 	if val, ok := activeTasks.Load(sourceID); ok {
 		val.(collectTask).cancel()
 	}
@@ -250,20 +425,24 @@ func PrepareSingleCollectStart(source model.FilmSource) error {
 }
 
 func markSourcesFinalizing(sources map[string]model.FilmSource) {
+	ids := make([]string, 0, len(sources))
 	for _, source := range sources {
+		ids = append(ids, source.Id)
 		updateCollectProgress(source.Id, func(progress *model.CollectProgress) {
-			if progress.Status == "starting" || progress.Status == "running" || progress.Status == "stopped" || progress.Status == "done" {
-				progress.Status = "finalizing"
+			if canEnterFinalizing(progress.Status) {
+				progress.Status = progressStatusFinalizing
 			}
 		})
 	}
+	// 整批进入收尾前，确保合并的 stats/缓存已刷出。
+	flushCollectHotpathSideEffects(ids...)
 }
 
 func markSourcesPublished(sources map[string]model.FilmSource) {
 	for _, source := range sources {
 		updateCollectProgress(source.Id, func(progress *model.CollectProgress) {
-			if progress.Status == "finalizing" {
-				progress.Status = "done"
+			if progress.Status == progressStatusFinalizing {
+				progress.Status = progressStatusDone
 			}
 		})
 	}
@@ -272,8 +451,8 @@ func markSourcesPublished(sources map[string]model.FilmSource) {
 func markSourcesFinalizeFailed(sources map[string]model.FilmSource) {
 	for _, source := range sources {
 		updateCollectProgress(source.Id, func(progress *model.CollectProgress) {
-			if progress.Status == "finalizing" {
-				progress.Status = "failed"
+			if progress.Status == progressStatusFinalizing {
+				progress.Status = progressStatusFailed
 			}
 		})
 	}
@@ -850,17 +1029,36 @@ func waitSourceRequestTurn(ctx context.Context, s *model.FilmSource, tag string)
 			gate.mu.Unlock()
 			return func(requestErr error) {
 				if requestErr == nil {
+					gate.mu.Lock()
+					if gate.rateLimitHits > 0 {
+						gate.rateLimitHits = 0
+					}
+					gate.mu.Unlock()
 					return
 				}
 				if utils.IsRateLimitedErr(requestErr) {
-					protectUntil := time.Now().Add(interval)
 					gate.mu.Lock()
+					gate.rateLimitHits++
+					hits := gate.rateLimitHits
+					if hits > 5 {
+						hits = 5
+					}
+					// 指数退避：每次 429 限流保护时间按 2^(hits-1) 翻倍延长 (1s, 2s, 4s, 8s, 16s)
+					backoffFactor := time.Duration(1 << uint(hits-1))
+					cooldown := interval * backoffFactor
+					if cooldown < 1*time.Second {
+						cooldown = 1 * time.Second
+					}
+					if cooldown > 15*time.Second {
+						cooldown = 15 * time.Second
+					}
+					protectUntil := time.Now().Add(cooldown)
 					if gate.nextAllowedAt.Before(protectUntil) {
 						gate.nextAllowedAt = protectUntil
 					}
 					nextAllowedAt := gate.nextAllowedAt
 					gate.mu.Unlock()
-					log.Printf("[Spider][RateLimit] 站点 %s %s触发限流，延长保护冷却 cooldown_ms=%d next_at=%d err=%v", s.Name, tag, interval.Milliseconds(), nextAllowedAt.UnixMilli(), requestErr)
+					log.Printf("[Spider][RateLimit] 站点 %s %s触发限流，指数退避冷却 cooldown_ms=%d (hits=%d) next_at=%d err=%v", s.Name, tag, cooldown.Milliseconds(), hits, nextAllowedAt.UnixMilli(), requestErr)
 					return
 				}
 			}, nil
@@ -900,7 +1098,7 @@ func getPageCountWithRetry(ctx context.Context, s *model.FilmSource, r utils.Req
 		}
 		release(err)
 		lastErr = err
-		if attempt < pageCountRetryTimes && utils.IsRateLimitedErr(err) {
+		if attempt < pageCountRetryTimes {
 			if waitErr := waitRetryBackoff(ctx, attempt); waitErr != nil {
 				return 0, waitErr
 			}
@@ -937,7 +1135,7 @@ func getFilmDetailWithRetry(ctx context.Context, s *model.FilmSource, r utils.Re
 		} else {
 			lastErr = errors.New("response list is empty")
 		}
-		if attempt < filmDetailRetryTimes && utils.IsRateLimitedErr(lastErr) {
+		if attempt < filmDetailRetryTimes {
 			if waitErr := waitRetryBackoff(ctx, attempt); waitErr != nil {
 				return nil, waitErr
 			}
@@ -950,11 +1148,14 @@ func waitRetryBackoff(ctx context.Context, attempt int) error {
 	if attempt <= 0 {
 		attempt = 1
 	}
-	delayIndex := attempt - 1
-	if delayIndex >= len(retryBackoffs) {
-		delayIndex = len(retryBackoffs) - 1
+	base := time.Duration(1<<uint(attempt-1)) * time.Second
+	if base > 10*time.Second {
+		base = 10 * time.Second
 	}
-	timer := time.NewTimer(retryBackoffs[delayIndex])
+	jitter := time.Duration(rand.Intn(500)) * time.Millisecond
+	delay := base + jitter
+
+	timer := time.NewTimer(delay)
 	defer timer.Stop()
 
 	select {
@@ -1084,6 +1285,8 @@ func handleCollectWithStopVersion(id string, h int, runVersion *uint64, flushAtE
 	}
 	defer func() {
 		originalErr := retErr
+		// 无论成功/失败/停止，结束本站时刷出合并的 stats 与缓存清理。
+		flushCollectHotpathSideEffects(s.Id)
 		if originalErr != nil && (!hadWrites || shouldSkipCollectPublishOnError(*s, h)) {
 			if isMasterFullCollect {
 				collectLifecycle.discardPendingMasterMIDs(s.Id)
@@ -1096,8 +1299,8 @@ func handleCollectWithStopVersion(id string, h int, runVersion *uint64, flushAtE
 		}
 		if flushAtEnd {
 			updateCollectProgress(s.Id, func(progress *model.CollectProgress) {
-				if progress.Status == "starting" || progress.Status == "running" || progress.Status == "stopped" || progress.Status == "done" {
-					progress.Status = "finalizing"
+				if canEnterFinalizing(progress.Status) {
+					progress.Status = progressStatusFinalizing
 				}
 			})
 			flushErr := collectLifecycle.finishSourceAndFlush(*s)
@@ -1105,15 +1308,23 @@ func handleCollectWithStopVersion(id string, h int, runVersion *uint64, flushAtE
 				retErr = flushErr
 			}
 			updateCollectProgress(s.Id, func(progress *model.CollectProgress) {
-				if flushErr != nil && progress.Status == "finalizing" {
-					progress.Status = "failed"
+				if flushErr != nil && progress.Status == progressStatusFinalizing {
+					progress.Status = progressStatusFailed
 					return
 				}
-				if progress.Status == "finalizing" {
-					progress.Status = "done"
+				if progress.Status == progressStatusFinalizing {
+					progress.Status = progressStatusDone
 				}
 			})
 			return
+		}
+		// 批量：分页已结束则保持 waiting_publish，等待整批 flushPending。
+		if !isCollectProgressStopped(s.Id) {
+			updateCollectProgress(s.Id, func(progress *model.CollectProgress) {
+				if progress.Status == progressStatusRunning || progress.Status == progressStatusStarting || progress.Status == progressStatusPageDone {
+					progress.Status = progressStatusWaitingPublish
+				}
+			})
 		}
 		collectLifecycle.endSourceAndQueueFlush(*s)
 	}()
@@ -1142,7 +1353,7 @@ func handleCollectWithStopVersion(id string, h int, runVersion *uint64, flushAtE
 				activeTasks.Delete(id)
 				updateCollectProgress(id, func(progress *model.CollectProgress) {
 					if retErr != nil {
-						progress.Status = "failed"
+						progress.Status = progressStatusFailed
 						return
 					}
 				})
@@ -1176,7 +1387,7 @@ func handleCollectWithStopVersion(id string, h int, runVersion *uint64, flushAtE
 			progress.Current = 0
 			progress.Success = 0
 			progress.Failed = 0
-			progress.Status = "done"
+			progress.Status = progressStatusDone
 		})
 		log.Printf("[Spider] 站点 %s 无需采集 (pageCount=%d，可能该时间段内无新内容)\n", s.Name, pageCount)
 		return nil
@@ -1186,7 +1397,7 @@ func handleCollectWithStopVersion(id string, h int, runVersion *uint64, flushAtE
 		progress.Current = 0
 		progress.Success = 0
 		progress.Failed = 0
-		progress.Status = "running"
+		progress.Status = progressStatusRunning
 	})
 	log.Printf("[Spider] 站点 %s 共 %d 页，开始采集...\n", s.Name, pageCount)
 
@@ -1197,6 +1408,9 @@ func handleCollectWithStopVersion(id string, h int, runVersion *uint64, flushAtE
 	}
 	if ctx.Err() != nil {
 		log.Printf("[Spider] 站点 %s 已停止接收新分页，等待收尾刷新\n", s.Name)
+	} else {
+		// 分页阶段完成：单站 → page_done；批量 → waiting_publish（defer 中也会兜底）。
+		markSourcePagesFinished(id, flushAtEnd)
 	}
 	if s.Grade == model.MasterCollect && s.SyncPictures {
 		triggerPictureSync()
@@ -1245,41 +1459,49 @@ func collectCategoryWithMode(s *model.FilmSource, preserveBusinessFields bool) e
 	return nil
 }
 
+func saveVirtualPicturesIfEnabled(s *model.FilmSource, list []model.MovieDetail) error {
+	if s.SyncPictures {
+		if err := repository.SaveVirtualPic(conver.ConvertVirtualPicture(list)); err != nil {
+			return fmt.Errorf("save virtual pictures failed: %w", err)
+		}
+	}
+	return nil
+}
+
+func saveSlavePlaylists(ctx context.Context, s *model.FilmSource, page int, list []model.MovieDetail) error {
+	lock := getSourceWriteLock(s.Id)
+	lock.Lock()
+	defer lock.Unlock()
+	err := runCollectDBWriteWithRetry(ctx, s.Name, page, func() error {
+		return filmrepo.SaveSitePlayList(s.Id, list)
+	})
+	if err != nil {
+		return fmt.Errorf("save slave playlists failed: %w", err)
+	}
+	return nil
+}
+
 // saveCollectedFilm 将已采集的 list 按站点类型写入存储，消除 collectFilm/collectFilmById 中的重复 switch 块。
 // saveMaster 由调用方注入，区分批量(SaveDetails)与单条(SaveDetail)两种写入策略。
 func saveCollectedFilm(s *model.FilmSource, list []model.MovieDetail, saveMaster func(string, []model.MovieDetail) error) error {
-	var err error
 	switch s.Grade {
 	case model.MasterCollect:
 		lock := getSourceWriteLock(s.Id)
 		lock.Lock()
 		defer lock.Unlock()
-		err = saveMaster(s.Id, list)
-		if err != nil {
+		if err := saveMaster(s.Id, list); err != nil {
 			return fmt.Errorf("save master details failed: %w", err)
 		}
-		if s.SyncPictures {
-			if err = repository.SaveVirtualPic(conver.ConvertVirtualPicture(list)); err != nil {
-				return fmt.Errorf("save virtual pictures failed: %w", err)
-			}
-		}
+		return saveVirtualPicturesIfEnabled(s, list)
 	case model.SlaveCollect:
-		lock := getSourceWriteLock(s.Id)
-		lock.Lock()
-		defer lock.Unlock()
-		err = runCollectDBWriteWithRetry(context.Background(), s.Name, 0, func() error {
-			return filmrepo.SaveSitePlayList(s.Id, list)
-		})
-		if err != nil {
-			return fmt.Errorf("save slave playlists failed: %w", err)
-		}
+		return saveSlavePlaylists(context.Background(), s, 0, list)
 	}
 	return nil
 }
 
 func saveCollectedFilmForCollect(ctx context.Context, s *model.FilmSource, page int, list []model.MovieDetail) ([]int64, error) {
 	if s.Grade != model.MasterCollect {
-		return nil, saveCollectedFilm(s, list, filmrepo.SaveDetails)
+		return nil, saveSlavePlaylists(ctx, s, page, list)
 	}
 
 	var affectedPids []int64
@@ -1297,10 +1519,8 @@ func saveCollectedFilmForCollect(ctx context.Context, s *model.FilmSource, page 
 	if err != nil {
 		return nil, fmt.Errorf("save master details failed: %w", err)
 	}
-	if s.SyncPictures {
-		if err = repository.SaveVirtualPic(conver.ConvertVirtualPicture(list)); err != nil {
-			return nil, fmt.Errorf("save virtual pictures failed: %w", err)
-		}
+	if err := saveVirtualPicturesIfEnabled(s, list); err != nil {
+		return nil, err
 	}
 	return affectedPids, nil
 }
@@ -1415,7 +1635,7 @@ func collectFilmPages(parentCtx context.Context, pageCount int, requestWorkerLim
 			stopErr = fmt.Errorf("站点 %s 连续采集失败 %d 次，已终止本次采集", s.Name, collectSourceConsecutiveFailureLimit)
 			log.Printf("[Spider] 站点 %s 连续失败达到阈值，终止采集 page=%d stage=%s err=%v", s.Name, page, stage, err)
 			updateCollectProgress(s.Id, func(progress *model.CollectProgress) {
-				progress.Status = "failed"
+				progress.Status = progressStatusFailed
 			})
 			cancel()
 		})
@@ -1426,9 +1646,17 @@ func collectFilmPages(parentCtx context.Context, pageCount int, requestWorkerLim
 		consecutiveFailuresMu.Unlock()
 	}
 	markStopped := func() {
-		updateCollectProgress(s.Id, func(progress *model.CollectProgress) {
-			progress.Status = "stopped"
-		})
+		markProgressStopped(s.Id)
+	}
+	// maybeMarkPagePhaseDone 最后一页完成后立刻切到 page_done，
+	// 避免 success+failed 已满仍长期显示「采集中」。
+	maybeMarkPagePhaseDone := func(progress *model.CollectProgress, snapshot collectPageStats) {
+		if progress.Status != progressStatusRunning && progress.Status != progressStatusStarting {
+			return
+		}
+		if progress.Total > 0 && snapshot.success+snapshot.failed >= progress.Total {
+			progress.Status = progressStatusPageDone
+		}
 	}
 	recordPageFailure := func(page int, stage string, err error) {
 		snapshot := recordPageFinished(page, false)
@@ -1437,6 +1665,7 @@ func collectFilmPages(parentCtx context.Context, pageCount int, requestWorkerLim
 			if page > progress.Current {
 				progress.Current = page
 			}
+			maybeMarkPagePhaseDone(progress, snapshot)
 		})
 		saveFilmPageFailure(s, h, page, stage, err)
 		if shouldLogCollectFailure(snapshot.failed) {
@@ -1461,6 +1690,7 @@ func collectFilmPages(parentCtx context.Context, pageCount int, requestWorkerLim
 			if page > progress.Current {
 				progress.Current = page
 			}
+			maybeMarkPagePhaseDone(progress, snapshot)
 		})
 		logProgress(false)
 	}
@@ -1473,9 +1703,7 @@ func collectFilmPages(parentCtx context.Context, pageCount int, requestWorkerLim
 			for {
 				select {
 				case <-ctx.Done():
-					updateCollectProgress(s.Id, func(progress *model.CollectProgress) {
-						progress.Status = "stopped"
-					})
+					markStopped()
 					return
 				case pg, ok := <-pages:
 					if !ok {
@@ -1485,7 +1713,7 @@ func collectFilmPages(parentCtx context.Context, pageCount int, requestWorkerLim
 						if pg > progress.Current {
 							progress.Current = pg
 						}
-						progress.Status = "running"
+						progress.Status = progressStatusRunning
 					})
 					list, err := getFilmDetailWithRetry(ctx, s, buildPageRequest(s, h, pg))
 					if err == nil && len(list) == 0 {
@@ -1502,7 +1730,8 @@ func collectFilmPages(parentCtx context.Context, pageCount int, requestWorkerLim
 					page := pg
 					items := list
 					writeWG.Add(1)
-					submitErr := collectWrites.submit(context.Background(), collectWriteJob{
+					// 使用采集 ctx：写库 buffer 反压等待时可被停止信号取消。
+					submitErr := collectWrites.submit(ctx, collectWriteJob{
 						sourceID:   s.Id,
 						sourceName: s.Name,
 						grade:      s.Grade,
@@ -1518,15 +1747,12 @@ func collectFilmPages(parentCtx context.Context, pageCount int, requestWorkerLim
 					if submitErr != nil {
 						writeWG.Done()
 						if ctx.Err() != nil {
-							updateCollectProgress(s.Id, func(progress *model.CollectProgress) {
-								progress.Status = "stopped"
-							})
+							markStopped()
 							return
 						}
 						recordPageFailure(page, "enqueue", submitErr)
 						continue
 					}
-					recordSuccess()
 				}
 			}
 		}()
@@ -1623,8 +1849,7 @@ func BatchCollect(h int, ids ...string) {
 	runSourcesWithLimit(sources, h, "Batch-Collect")
 }
 
-func getEnabledSourcesByGrade(grade model.SourceGrade) []model.FilmSource {
-	sources := repository.GetCollectSourceListByGrade(grade)
+func filterEnabledSources(sources []model.FilmSource) []model.FilmSource {
 	enabled := make([]model.FilmSource, 0, len(sources))
 	for _, s := range sources {
 		if s.State {
@@ -1634,15 +1859,13 @@ func getEnabledSourcesByGrade(grade model.SourceGrade) []model.FilmSource {
 	return enabled
 }
 
+func getEnabledSourcesByGrade(grade model.SourceGrade) []model.FilmSource {
+	return filterEnabledSources(repository.GetCollectSourceListByGrade(grade))
+}
+
 // AutoCollect 自动进行对所有已启用站点的采集任务
 func AutoCollect(h int) {
-	sources := repository.GetCollectSourceList()
-	enabled := make([]model.FilmSource, 0, len(sources))
-	for _, source := range sources {
-		if source.State {
-			enabled = append(enabled, source)
-		}
-	}
+	enabled := filterEnabledSources(repository.GetCollectSourceList())
 	if len(enabled) == 0 {
 		log.Println("[Spider] 自动采集：未找到任何启用的站点")
 		return
@@ -1671,13 +1894,7 @@ func CollectSingleFilm(ids string) {
 		return
 	}
 
-	all := repository.GetCollectSourceList()
-	enabled := make([]model.FilmSource, 0, len(all))
-	for _, source := range all {
-		if source.State {
-			enabled = append(enabled, source)
-		}
-	}
+	enabled := filterEnabledSources(repository.GetCollectSourceList())
 	if len(enabled) == 0 {
 		log.Println("[Spider] CollectSingleFilm: 未找到任何启用的站点")
 		return
@@ -1875,8 +2092,14 @@ func GetActiveTasks() []string {
 }
 
 func GetActiveTaskProgress() []model.CollectProgress {
+	startCollectProgressHousekeeping()
+
 	list := make([]model.CollectProgress, 0)
 	seen := make(map[string]struct{})
+	retainFor := progressRetainDuration()
+	staleAfter := progressStaleDuration()
+	now := time.Now()
+
 	activeTasks.Range(func(key, value any) bool {
 		id := key.(string)
 		seen[id] = struct{}{}
@@ -1884,7 +2107,7 @@ func GetActiveTaskProgress() []model.CollectProgress {
 			list = append(list, progress)
 			return true
 		}
-		list = append(list, model.CollectProgress{Id: id, Status: "running"})
+		list = append(list, model.CollectProgress{Id: id, Status: progressStatusRunning})
 		return true
 	})
 	collectProgress.Range(func(key, value any) bool {
@@ -1893,12 +2116,41 @@ func GetActiveTaskProgress() []model.CollectProgress {
 			return true
 		}
 		state := value.(*collectProgressState)
-		state.mu.RLock()
+		state.mu.Lock()
 		progress := state.data
-		state.mu.RUnlock()
-		if progress.Status == "starting" || progress.Status == "running" || progress.Status == "finalizing" {
-			list = append(list, progress)
+		updated := state.updated
+		age := now.Sub(updated)
+
+		// 活跃但已超时且无 live task → 就地 failed，仍可按 retain 短暂展示。
+		if isActiveCollectStatus(progress.Status) {
+			_, live := activeTasks.Load(id)
+			liveFetch := live && (progress.Status == progressStatusRunning || progress.Status == progressStatusStarting)
+			if !liveFetch && age >= staleAfter {
+				old := progress.Status
+				progress.Status = progressStatusFailed
+				state.data.Status = progressStatusFailed
+				state.updated = now
+				updated = now
+				log.Printf("[Spider] 进度超时清理 source=%s status=%s age=%s -> failed", id, old, age.Round(time.Second))
+			} else {
+				state.mu.Unlock()
+				list = append(list, progress)
+				return true
+			}
 		}
+
+		if progress.Status == progressStatusDone || progress.Status == progressStatusFailed || progress.Status == progressStatusStopped {
+			if now.Sub(updated) < retainFor {
+				state.mu.Unlock()
+				list = append(list, progress)
+				return true
+			}
+			// 超过保留窗口：删除，避免 map 无限增长。
+			state.mu.Unlock()
+			collectProgress.Delete(id)
+			return true
+		}
+		state.mu.Unlock()
 		return true
 	})
 	return list
@@ -1911,8 +2163,9 @@ func StopAllTasks() {
 	collectProgress.Range(func(key, value any) bool {
 		state := value.(*collectProgressState)
 		state.mu.Lock()
-		if state.data.Status == "starting" || state.data.Status == "running" {
-			state.data.Status = "stopped"
+		// 仅中断仍在拉页/排队的任务；已 page_done / waiting_publish 的交给收尾发布。
+		if state.data.Status == progressStatusStarting || state.data.Status == progressStatusRunning {
+			state.data.Status = progressStatusStopped
 			state.updated = time.Now()
 		}
 		state.mu.Unlock()
@@ -1924,9 +2177,7 @@ func StopAllTasks() {
 			count++
 		}
 		if id, ok := key.(string); ok {
-			updateCollectProgress(id, func(progress *model.CollectProgress) {
-				progress.Status = "stopped"
-			})
+			markProgressStopped(id)
 		}
 		return true
 	})
@@ -1942,18 +2193,38 @@ func finalizeStoppedCollectTasks() {
 	}
 }
 
-// IsTaskRunning 查询指定站点的采集任务是否正在运行
+// IsTaskRunning 查询指定站点的采集任务是否仍处于活跃生命周期（含等待收尾）。
 func IsTaskRunning(id string) bool {
-	_, ok := activeTasks.Load(id)
-	return ok
+	if _, ok := activeTasks.Load(id); ok {
+		return true
+	}
+	if progress, ok := collectProgressSnapshot(id); ok {
+		return isActiveCollectStatus(progress.Status)
+	}
+	return false
 }
 
-// IsAnyTaskRunning 查询系统中是否有任何采集任务正在进行
+// IsAnyTaskRunning 查询系统中是否有任何采集任务正在进行（含等待收尾）。
 func IsAnyTaskRunning() bool {
-	running := false
+	found := false
 	activeTasks.Range(func(key, value any) bool {
-		running = true
-		return false // 找到一个就退出循环
+		found = true
+		return false
 	})
-	return running
+	if found {
+		return true
+	}
+	hasActive := false
+	collectProgress.Range(func(key, value any) bool {
+		state := value.(*collectProgressState)
+		state.mu.RLock()
+		active := isActiveCollectStatus(state.data.Status)
+		state.mu.RUnlock()
+		if active {
+			hasActive = true
+			return false
+		}
+		return true
+	})
+	return hasActive
 }

@@ -96,6 +96,19 @@ function finishBar() {
   }, 360);
 }
 
+export function startNavigationLoading(label: string = "页面加载中") {
+  startLoading(label);
+}
+
+export function finishNavigationLoading() {
+  stopLoading();
+}
+
+export function forceFinishNavigationLoading() {
+  activeCount = 0;
+  finishBar();
+}
+
 function startLoading(label: string) {
   activeCount += 1;
   showBar(label);

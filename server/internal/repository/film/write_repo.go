@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -68,6 +69,9 @@ func upsertFilmIndexesTx(tx *gorm.DB, list []model.FilmIndex) error {
 	if len(list) == 0 {
 		return nil
 	}
+	sort.Slice(list, func(i, j int) bool {
+		return list[i].ContentKey < list[j].ContentKey
+	})
 	return tx.Clauses(filmIndexContentKeyUpsert()).CreateInBatches(&list, upsertBatchSize).Error
 }
 
@@ -145,6 +149,12 @@ func saveMovieSourceMappingsTxE(tx *gorm.DB, mappings []model.MovieSourceMapping
 	}
 	movieSourceMappingWriteMu.Lock()
 	defer movieSourceMappingWriteMu.Unlock()
+	sort.Slice(mappings, func(i, j int) bool {
+		if mappings[i].SourceId == mappings[j].SourceId {
+			return mappings[i].SourceMid < mappings[j].SourceMid
+		}
+		return mappings[i].SourceId < mappings[j].SourceId
+	})
 	return tx.Clauses(movieSourceMappingUpsert()).CreateInBatches(&mappings, upsertBatchSize).Error
 }
 
@@ -439,17 +449,20 @@ func saveDetails(id string, list []model.MovieDetail, refreshSearchTags bool) ([
 	}); err != nil {
 		return nil, err
 	}
-	if err := repository.TouchCollectSourceStatsTx(db.Mdb, id, time.Now()); err != nil {
-		log.Printf("TouchCollectSourceStats Error: %v", err)
-	}
-
 	if len(changedInfos) == 0 {
 		return affectedMIDs, nil
 	}
 
-	clearFilmIndexCachesByPids(changedInfos)
+	// 仅在有实质变更时更新 last_collect_time / 失效缓存。
 	if refreshSearchTags {
+		if err := repository.TouchCollectSourceStatsTx(db.Mdb, id, time.Now()); err != nil {
+			log.Printf("TouchCollectSourceStats Error: %v", err)
+		}
+		clearFilmIndexCachesByPids(changedInfos)
 		BatchHandleSearchTag(changedInfos...)
+	} else {
+		repository.NoteCollectSourceStats(id)
+		NoteCollectCacheInvalidationByIndexes(changedInfos)
 	}
 	return affectedMIDs, nil
 }
