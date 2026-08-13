@@ -28,13 +28,18 @@ EcoHub 是一个前后端分离的影视聚合系统。后端负责定时采集�
 - 管理后台：[https://eco.fe-spark.cn/manage](https://eco.fe-spark.cn/manage)
 - 演示访客账号/密码：`guest / guest`
 
+## 当前版本
+
+正式版 **v2.0+** 发布形态为 **All-in-One 单镜像** `ghcr.io/fe-spark/ecohub`（同容器托管 Web + API）。变更记录见 [RELEASE.md](./RELEASE.md)。
+
 ## 项目定位
 
 EcoHub 的核心不是把多个资源站简单平铺入库，而是以“单主站 + 多附属站”的方式归并内容：
 
 - 主站负责影片主数据、检索索引、分类和详情骨架。
 - 附属站负责补充播放源，并挂载到主站影片下。
-- 内容归并优先使用豆瓣 ID，缺失时使用内容指纹。
+- **主站身份键**（`film_index.content_key`）：优先 `vod_{源站vod_id}`，无 ID 时回退 `name_{hash}`。
+- **跨站匹配**（`movie_match_key`）：优先豆瓣身份，其次规范化片名，用于附属站播放源对齐。
 - 前台、后台、TVBox / MacCMS 接口共用一致的分类、筛选和排序语义。
 - 采集任务完成并发布快照后，入库影片会在前台页面、后台列表和开放接口中可见。
 - 后台支持单片更新全部站点，便于补齐多来源播放列表。
@@ -76,11 +81,12 @@ flowchart TD
 ├── deploy/release/      # 发布版 Docker Compose 配置
 ├── scripts/             # 发布版安装脚本
 ├── docker-compose.yml   # 源码版 Web / API / MySQL / Redis 容器编排
-├── README-Docker.md     # Docker 部署说明
+├── README-Deploy.md     # 全部署方式（脚本 / 1Panel / 外部库 / 源码版）
 ├── README-FAQ.md        # FAQ 与排障
 ├── server/README.md     # 服务端开发说明
 └── web/README.md        # 前端开发说明
 ```
+
 
 ## 技术栈
 
@@ -123,9 +129,16 @@ npm run dev
 - [服务端说明](./server/README.md)
 - [前端说明](./web/README.md)
 
-### Docker 部署
+### Docker 部署（推荐）
 
-Docker / GHCR 镜像和 Compose 部署方式见 [Docker 部署说明](./README-Docker.md)。
+发布版一键安装（拉取 `ghcr.io/fe-spark/ecohub:latest` + 内置 MySQL/Redis）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/fe-spark/EcoHub/main/scripts/install-release.sh | sh
+cd ~/ecohub && docker compose up -d
+```
+
+全部署方式（安装脚本、1Panel、外部库、源码版 Compose、反代 HTTPS）见 [部署指南](./README-Deploy.md)；版本说明见 [RELEASE.md](./RELEASE.md)。
 
 ## 文档导航
 
@@ -133,7 +146,8 @@ Docker / GHCR 镜像和 Compose 部署方式见 [Docker 部署说明](./README-D
 | --- | --- |
 | [server/README.md](./server/README.md) | 服务端启动、环境变量、采集模型、接口分组、鉴权模型 |
 | [web/README.md](./web/README.md) | 前端启动、API 转发、页面结构、鉴权边界 |
-| [README-Docker.md](./README-Docker.md) | Docker Compose 部署、外部数据库、内置数据库、持久化建议 |
+| [README-Deploy.md](./README-Deploy.md) | 安装脚本 / 1Panel / 外部库 / 源码版 / 反代与排障 |
+| [RELEASE.md](./RELEASE.md) | 版本变更与镜像 tag |
 | [README-FAQ.md](./README-FAQ.md) | 主站机制、缓存、排序、登录态、Docker 常见问题 |
 
 ## 默认账号

@@ -17,9 +17,10 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-func SaveSitePlayList(sourceID string, list []model.MovieDetail) error {
+// SaveSitePlayList 写入附属站播放列表，返回「播放源实质变更」对应的全局 mid。
+func SaveSitePlayList(sourceID string, list []model.MovieDetail) ([]int64, error) {
 	if len(list) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	var playlists []model.MoviePlaylist
@@ -59,39 +60,101 @@ func SaveSitePlayList(sourceID string, list []model.MovieDetail) error {
 	}
 
 	if len(keysByMovieKey) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	changes, err := saveGroupedPlaylists(sourceID, playlists, keysByMovieKey)
 	if err != nil {
 		log.Printf("SaveSitePlayList Error: %v", err)
-		return err
+		return nil, err
 	}
-	if err := scheduleSearchInfoRefreshByPlaylists(sourceID, list, changes); err != nil {
+	changedMids, err := scheduleSearchInfoRefreshByPlaylists(sourceID, list, changes)
+	if err != nil {
 		log.Printf("scheduleSearchInfoRefreshByPlaylists Error: %v", err)
-		return err
+		return nil, err
 	}
 	// 仅在有播放源实质变更时更新 last_collect_time。
 	if len(changes) > 0 {
 		repository.NoteCollectSourceStats(sourceID)
 	}
 
-	return nil
+	return changedMids, nil
 }
 
-func scheduleSearchInfoRefreshByPlaylists(sourceID string, details []model.MovieDetail, changes []playlistChange) error {
+// scheduleSearchInfoRefreshByPlaylists 刷新附属站映射/时间戳，并返回有变更的全局 mid。
+func scheduleSearchInfoRefreshByPlaylists(sourceID string, details []model.MovieDetail, changes []playlistChange) ([]int64, error) {
 	infos, err := loadMatchedSearchInfosByDetails(details)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := saveSlaveSourceMappings(sourceID, details, infos); err != nil {
-		return err
+		return nil, err
 	}
-	if err := touchSlavePlaylistUpdateStamps(changes); err != nil {
-		return err
+	// 更新列表 mid：仅「任一线路最后一集变化 / 首次写入」的变更（见 buildSlavePlaylistUpdateStamps）
+	changedMids, err := touchSlavePlaylistUpdateStamps(sourceID, changes)
+	if err != nil {
+		return nil, err
 	}
-	SchedulePlaySummaryRefresh(infos...)
-	return nil
+	// 播放源摘要：仅对本批有 playlist 写入的 mid 刷新，避免每次把页内全部匹配片（数十上百）刷进 finalizer
+	if refreshMIDs := slavePlaylistAffectedMIDs(changes); len(refreshMIDs) > 0 {
+		refreshInfos := filterFilmIndexesByMIDs(infos, refreshMIDs)
+		if len(refreshInfos) == 0 {
+			// infos 可能因匹配策略未包含某 mid：按 mid 回表
+			var rows []model.FilmIndex
+			if err := db.Mdb.Where("mid IN ?", refreshMIDs).Find(&rows).Error; err == nil {
+				refreshInfos = rows
+			}
+		}
+		SchedulePlaySummaryRefresh(refreshInfos...)
+	}
+	return changedMids, nil
+}
+
+func filterFilmIndexesByMIDs(infos []model.FilmIndex, mids []int64) []model.FilmIndex {
+	if len(infos) == 0 || len(mids) == 0 {
+		return nil
+	}
+	want := make(map[int64]struct{}, len(mids))
+	for _, mid := range mids {
+		if mid > 0 {
+			want[mid] = struct{}{}
+		}
+	}
+	out := make([]model.FilmIndex, 0, len(want))
+	for _, info := range infos {
+		if _, ok := want[info.Mid]; ok {
+			out = append(out, info)
+		}
+	}
+	return out
+}
+
+// slavePlaylistAffectedMIDs 任意 playlist 写入（含仅链接刷新）涉及的 mid，每个 movie_key 只取一个最优 mid。
+func slavePlaylistAffectedMIDs(changes []playlistChange) []int64 {
+	if len(changes) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(changes))
+	for _, c := range changes {
+		if k := strings.TrimSpace(c.MovieKey); k != "" {
+			keys = append(keys, k)
+		}
+	}
+	midsByKey := loadMidCandidatesByMatchKeys(keys)
+	seen := make(map[int64]struct{})
+	out := make([]int64, 0, len(changes))
+	for _, c := range changes {
+		mid := pickBestMidForMatchKey(midsByKey[c.MovieKey])
+		if mid <= 0 {
+			continue
+		}
+		if _, ok := seen[mid]; ok {
+			continue
+		}
+		seen[mid] = struct{}{}
+		out = append(out, mid)
+	}
+	return out
 }
 
 func loadMatchedSearchInfosByDetails(details []model.MovieDetail) ([]model.FilmIndex, error) {
@@ -202,13 +265,21 @@ func loadMatchedSearchInfosByMovieKeys(movieKeys []string) ([]model.FilmIndex, e
 	return infos, nil
 }
 
-func touchSlavePlaylistUpdateStamps(changes []playlistChange) error {
-	updateStampByMid, err := buildSlavePlaylistUpdateStamps(changes)
+// touchSlavePlaylistUpdateStamps 刷新「应进更新列表」影片的 update_stamp，返回这些全局 mid。
+// 仅链接/中间集变化（各线路最后一项标签相同）的保存已在 saveGroupedPlaylists 完成，不抬 stamp、不进更新列表。
+func touchSlavePlaylistUpdateStamps(sourceID string, changes []playlistChange) ([]int64, error) {
+	notifyChanges := make([]playlistChange, 0, len(changes))
+	for _, c := range changes {
+		if c.NotifyWorthy {
+			notifyChanges = append(notifyChanges, c)
+		}
+	}
+	updateStampByMid, err := buildSlavePlaylistUpdateStamps(sourceID, notifyChanges)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if len(updateStampByMid) == 0 {
-		return nil
+		return nil, nil
 	}
 	caseExpr := "CASE mid"
 	mids := make([]int64, 0, len(updateStampByMid))
@@ -219,12 +290,15 @@ func touchSlavePlaylistUpdateStamps(changes []playlistChange) error {
 		mids = append(mids, mid)
 	}
 	caseExpr += " ELSE update_stamp END"
-	return db.Mdb.Model(&model.FilmIndex{}).
+	if err := db.Mdb.Model(&model.FilmIndex{}).
 		Where("mid IN ?", mids).
-		Update("update_stamp", clause.Expr{SQL: caseExpr, Vars: args}).Error
+		Update("update_stamp", clause.Expr{SQL: caseExpr, Vars: args}).Error; err != nil {
+		return nil, err
+	}
+	return mids, nil
 }
 
-func buildSlavePlaylistUpdateStamps(changes []playlistChange) (map[int64]int64, error) {
+func buildSlavePlaylistUpdateStamps(sourceID string, changes []playlistChange) (map[int64]int64, error) {
 	movieKeys := make([]string, 0, len(changes))
 	changeByKey := make(map[string]playlistChange, len(changes))
 	for _, change := range changes {
@@ -238,16 +312,33 @@ func buildSlavePlaylistUpdateStamps(changes []playlistChange) (map[int64]int64, 
 	if len(midsByLookupKey) == 0 {
 		return nil, nil
 	}
-	firstInsertMIDs := make([]int64, 0, len(changes))
-	for movieKey, mids := range midsByLookupKey {
-		if !changeByKey[movieKey].FirstInsert {
+
+	// 每个 movie_key 只绑定一个最优 mid，避免标点重复片（烬九州：第二季 / 烬九州第二季）共享 key 时双双进更新列表
+	midByKey := make(map[string]int64, len(midsByLookupKey))
+	for key, mids := range midsByLookupKey {
+		mid := pickBestMidForMatchKey(mids)
+		if mid <= 0 {
 			continue
 		}
-		for _, mid := range mids {
-			if mid > 0 {
-				firstInsertMIDs = append(firstInsertMIDs, mid)
-			}
+		midByKey[key] = mid
+	}
+	if len(midByKey) == 0 {
+		return nil, nil
+	}
+
+	allMIDs := make([]int64, 0, len(midByKey))
+	for _, mid := range midByKey {
+		allMIDs = append(allMIDs, mid)
+	}
+	existingCountsMap, _ := loadExistingEpisodeCountsByMIDs(db.Mdb, allMIDs, sourceID)
+
+	firstInsertMIDs := make([]int64, 0, len(changes))
+	for movieKey, mid := range midByKey {
+		change := changeByKey[movieKey]
+		if !change.FirstInsert {
+			continue
 		}
+		firstInsertMIDs = append(firstInsertMIDs, mid)
 	}
 	masterUpdateStampByMid, err := loadMasterUpdateStampsByMids(firstInsertMIDs)
 	if err != nil {
@@ -255,26 +346,69 @@ func buildSlavePlaylistUpdateStamps(changes []playlistChange) (map[int64]int64, 
 	}
 
 	now := time.Now().Unix()
-	result := make(map[int64]int64, len(changes))
-	for movieKey, mids := range midsByLookupKey {
+	result := make(map[int64]int64, len(midByKey))
+	for movieKey, mid := range midByKey {
 		change := changeByKey[movieKey]
-		for _, mid := range mids {
-			if mid <= 0 {
-				continue
-			}
-			updateStamp := now
-			if change.FirstInsert {
-				updateStamp = masterUpdateStampByMid[mid]
-			}
+		// 全库已有线路：仅当本源分集数量严格大于历史最大集数才进更新列表（含附属站首次写入）
+		existingCounts := existingCountsMap[mid]
+		newCounts := extractEpisodeCountsFromPlaylistSignatures(change.Signatures)
+		if !isEpisodeCountHigher(newCounts, existingCounts) {
+			// 数量未增加（如已有15集，后更新的源也是15集） -> 不进更新列表
+			continue
+		}
+		updateStamp := now
+		if change.FirstInsert {
+			updateStamp = masterUpdateStampByMid[mid]
 			if updateStamp <= 0 {
 				continue
 			}
-			if existing, ok := result[mid]; !ok || updateStamp > existing {
-				result[mid] = updateStamp
-			}
+		}
+		if existing, ok := result[mid]; !ok || updateStamp > existing {
+			result[mid] = updateStamp
 		}
 	}
 	return result, nil
+}
+
+// pickBestMidForMatchKey 同一 match_key 命中多个 mid 时只保留一个（update_stamp 新者优先，其次 mid 大）。
+// 源站常并存「烬九州：第二季」与「烬九州第二季」两个 vod_id，归一化后共享 match_key。
+func pickBestMidForMatchKey(mids []int64) int64 {
+	uniq := make([]int64, 0, len(mids))
+	seen := make(map[int64]struct{}, len(mids))
+	for _, mid := range mids {
+		if mid <= 0 {
+			continue
+		}
+		if _, ok := seen[mid]; ok {
+			continue
+		}
+		seen[mid] = struct{}{}
+		uniq = append(uniq, mid)
+	}
+	if len(uniq) == 0 {
+		return 0
+	}
+	if len(uniq) == 1 {
+		return uniq[0]
+	}
+	var rows []model.FilmIndex
+	if err := db.Mdb.Select("mid", "update_stamp").Where("mid IN ?", uniq).Find(&rows).Error; err != nil || len(rows) == 0 {
+		// 回退：取最大 mid（通常更新）
+		best := uniq[0]
+		for _, mid := range uniq[1:] {
+			if mid > best {
+				best = mid
+			}
+		}
+		return best
+	}
+	best := rows[0]
+	for _, row := range rows[1:] {
+		if row.UpdateStamp > best.UpdateStamp || (row.UpdateStamp == best.UpdateStamp && row.Mid > best.Mid) {
+			best = row
+		}
+	}
+	return best.Mid
 }
 
 func loadMasterUpdateStampsByMids(mids []int64) (map[int64]int64, error) {
@@ -310,6 +444,11 @@ func saveGroupedPlaylists(sourceID string, playlists []model.MoviePlaylist, keys
 			}
 			return playlists[i].MovieKey < playlists[j].MovieKey
 		})
+		// 同一 (movie_key, group_index) 只保留最后一行：同一影片在源站常有多个条目
+		// （如「XXX英语」「XXX国语」共享豆瓣匹配键），都会写入同一 (key, group) 槽位，
+		// 落库按唯一键后写覆盖。签名必须与落库语义对齐，否则每次采集都会把
+		// 「多条目并存」误判为结构变化，更新列表反复刷同一 mid。
+		playlists = dedupePlaylistRows(playlists)
 	}
 
 	var changes []playlistChange
@@ -346,8 +485,10 @@ func saveGroupedPlaylists(sourceID string, playlists []model.MoviePlaylist, keys
 }
 
 type playlistChange struct {
-	MovieKey    string
-	FirstInsert bool
+	MovieKey     string
+	FirstInsert  bool
+	NotifyWorthy bool // 任一线路「最后一项分集标签」有变化（含新增/回退/顺序变化）或首次写入才进更新列表；仅链接/中间集变化为 false
+	Signatures   []playlistSignature
 }
 
 type playlistSignature struct {
@@ -392,14 +533,100 @@ func buildPlaylistSignatures(playlists []model.MoviePlaylist) map[string][]playl
 func diffPlaylistMovieKeys(existing map[string][]playlistSignature, incoming map[string][]playlistSignature, movieKeys []string) []playlistChange {
 	changed := make([]playlistChange, 0, len(movieKeys))
 	for _, movieKey := range movieKeys {
-		if !samePlaylistSignatures(existing[movieKey], incoming[movieKey]) {
-			changed = append(changed, playlistChange{
-				MovieKey:    movieKey,
-				FirstInsert: len(existing[movieKey]) == 0,
-			})
+		left, right := existing[movieKey], incoming[movieKey]
+		if samePlaylistSignatures(left, right) {
+			continue
 		}
+		first := len(left) == 0
+		notifyWorthy := false
+		switch {
+		case len(right) == 0:
+			// right 为空 = 该 key 本次未出现（源站改名/条目消失后的残留或陈旧 key）→ 不是内容更新，
+			// 不进更新列表，否则改名/条目切换会让同一 mid 每批反复上报。
+		case first:
+			// 首次写入：确为新增内容
+			notifyWorthy = true
+		default:
+			// 任一线路「最后一项分集标签」与库中不同（含新增/回退/顺序变化）→ 进更新列表；
+			// 最后一项相同（仅链接/中间集变化）→ 写库但不通知。
+			notifyWorthy = playlistLastEpisodeChanged(left, right)
+		}
+		changed = append(changed, playlistChange{
+			MovieKey:     movieKey,
+			FirstInsert:  first,
+			NotifyWorthy: notifyWorthy,
+			Signatures:   right,
+		})
 	}
 	return changed
+}
+
+// playlistGroupKey 线路分组标识（分组序号 + 线路名）。
+type playlistGroupKey struct {
+	GroupIndex int
+	GroupName  string
+}
+
+// lastEpisodeLabel 线路的「最后一集」标签：取源站返回顺序的最后一个非空 Episode 原文。
+// macCMS 源站按集数/日期顺序返回（剧「第01集…第N集」、综艺「第20240107期…」），
+// 最后一项即最新一集；不解析数字，HD/正片等无数字标签同样适用。
+func lastEpisodeLabel(links []model.MovieUrlInfo) string {
+	last := ""
+	for _, u := range links {
+		if label := strings.TrimSpace(u.Episode); label != "" {
+			last = label
+		}
+	}
+	return last
+}
+
+// lastEpisodeByGroup 把线路签名转为「线路 → 最后一集标签」。
+func lastEpisodeByGroup(sigs []playlistSignature) map[playlistGroupKey]string {
+	out := make(map[playlistGroupKey]string, len(sigs))
+	for _, s := range sigs {
+		key := playlistGroupKey{GroupIndex: s.GroupIndex, GroupName: strings.TrimSpace(s.GroupName)}
+		var links []model.MovieUrlInfo
+		if err := json.Unmarshal([]byte(s.Content), &links); err != nil {
+			out[key] = ""
+			continue
+		}
+		out[key] = lastEpisodeLabel(links)
+	}
+	return out
+}
+
+// playlistLastEpisodeChanged 任一线路（按 GroupIndex+GroupName 对齐）的「最后一项分集标签」变化 → true。
+// 线路新增/消失、任一线路最后一项标签不同（含集数回退/顺序变化）都算变化；仅链接/中间集变化不算。
+func playlistLastEpisodeChanged(left, right []playlistSignature) bool {
+	leftByGroup := lastEpisodeByGroup(left)
+	rightByGroup := lastEpisodeByGroup(right)
+	if len(leftByGroup) != len(rightByGroup) {
+		return true
+	}
+	for key, label := range rightByGroup {
+		if oldLabel, ok := leftByGroup[key]; !ok || oldLabel != label {
+			return true
+		}
+	}
+	return false
+}
+
+// dedupePlaylistRows 按 (movie_key, group_index) 去重，保留最后一行。
+// 入参需已按 movie_key ASC, group_index ASC 排序；与落库 OnConflict 后写覆盖语义一致。
+func dedupePlaylistRows(rows []model.MoviePlaylist) []model.MoviePlaylist {
+	if len(rows) < 2 {
+		return rows
+	}
+	out := rows[:0]
+	for i := 0; i < len(rows); {
+		j := i + 1
+		for j < len(rows) && rows[j].MovieKey == rows[i].MovieKey && rows[j].GroupIndex == rows[i].GroupIndex {
+			j++
+		}
+		out = append(out, rows[j-1])
+		i = j
+	}
+	return out
 }
 
 func samePlaylistSignatures(left []playlistSignature, right []playlistSignature) bool {
@@ -407,11 +634,55 @@ func samePlaylistSignatures(left []playlistSignature, right []playlistSignature)
 		return false
 	}
 	for index := range left {
-		if left[index] != right[index] {
+		if left[index].GroupIndex != right[index].GroupIndex {
+			return false
+		}
+		if left[index].GroupName != right[index].GroupName {
+			return false
+		}
+		if normalizePlaylistCompareContent(left[index].Content) != normalizePlaylistCompareContent(right[index].Content) {
 			return false
 		}
 	}
 	return true
+}
+
+// normalizePlaylistCompareContent 归一化播放列表内容用于「是否需要写库」对比：
+// trim 集数、去掉链接 query。仅用于对比，不影响实际保存的播放数据。
+func normalizePlaylistCompareContent(raw string) string {
+	if strings.TrimSpace(raw) == "" {
+		return raw
+	}
+	var links []model.MovieUrlInfo
+	if err := json.Unmarshal([]byte(raw), &links); err != nil {
+		return raw
+	}
+	out := make([]model.MovieUrlInfo, len(links))
+	for i, u := range links {
+		out[i] = model.MovieUrlInfo{
+			Episode: strings.TrimSpace(u.Episode),
+			Link:    stripURLQuery(strings.TrimSpace(u.Link)),
+		}
+	}
+	data, _ := json.Marshal(out)
+	return string(data)
+}
+
+// playlistEpisodeLabelSignature 集数标签序列（仅诊断展示用，非更新列表判定）。
+func playlistEpisodeLabelSignature(raw string) string {
+	if strings.TrimSpace(raw) == "" {
+		return "[]"
+	}
+	var links []model.MovieUrlInfo
+	if err := json.Unmarshal([]byte(raw), &links); err != nil {
+		return raw
+	}
+	labels := make([]string, len(links))
+	for i, u := range links {
+		labels[i] = strings.TrimSpace(u.Episode)
+	}
+	data, _ := json.Marshal(labels)
+	return string(data)
 }
 
 func DeletePlaylistBySourceId(sourceID string) error {

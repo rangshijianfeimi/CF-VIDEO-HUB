@@ -12,8 +12,10 @@ import {
   Pagination,
   Tooltip,
   Typography,
+  Card,
 } from "antd";
 import {
+  SearchOutlined,
   ReloadOutlined,
   DeleteOutlined,
   WarningOutlined,
@@ -22,6 +24,7 @@ import type { ColumnsType } from "antd/es/table";
 import { ApiGet, ApiPost } from "@/lib/client-api";
 import dayjs from "dayjs";
 import { useAppMessage } from "@/lib/useAppMessage";
+import { useManagePermission } from "@/lib/manage-permission";
 import ManagePageHeader from "@/app/manage/components/page-header";
 import styles from "./index.module.less";
 
@@ -78,19 +81,22 @@ export default function FailureRecordPageView() {
     beginTime: "",
     endTime: "",
   });
+  const [dateRange, setDateRange] = useState<any>(null);
   const [options, setOptions] = useState<any>({
     origin: [],
     status: [],
   });
   const { message } = useAppMessage();
+  const { canWrite } = useManagePermission();
 
   const getRecords = useCallback(
-    async (p?: any) => {
+    async (p?: any, overrideParams?: any) => {
       setLoading(true);
       const pg = p || page;
+      const reqParams = overrideParams || params;
       try {
         const resp = await ApiGet("/manage/collect/record/list", {
-          ...params,
+          ...reqParams,
           current: pg.current,
           pageSize: pg.pageSize,
         });
@@ -119,7 +125,7 @@ export default function FailureRecordPageView() {
     const resp = await ApiPost("/manage/collect/record/retry", { id });
     if (resp.code === 0) {
       setQueuedRetryIds((prev) => new Set(prev).add(id));
-      message.success("重试任务已加入队列；如果对应站点正在采集，会在采集结束后自动执行");
+      message.success("重试任务已加入队列；如果对应采集站正在采集，会在采集结束后自动执行");
       window.setTimeout(() => {
         setQueuedRetryIds((prev) => {
           const next = new Set(prev);
@@ -231,7 +237,7 @@ export default function FailureRecordPageView() {
         const tooltipTitle = isSuccess
           ? "已重试成功，无需再次重试"
           : isQueued
-            ? "已加入重试队列；同站点全量采集中时会等待采集结束"
+            ? "已加入重试队列；同采集站全量采集中时会等待采集结束"
           : isFinalFailed
             ? "手动再试，失败后仍保持最终失败"
             : "立即重试此记录";
@@ -242,7 +248,7 @@ export default function FailureRecordPageView() {
               shape="circle"
               size="small"
               loading={isQueued}
-              disabled={isSuccess || isQueued}
+              disabled={!canWrite || isSuccess || isQueued}
               style={isSuccess ? undefined : { background: "#52c41a", borderColor: "#52c41a" }}
               icon={<ReloadOutlined />}
               onClick={() => handleRetry(record.ID)}
@@ -255,14 +261,14 @@ export default function FailureRecordPageView() {
 
   return (
     <div className={styles.pageBody}>
-        <ManagePageHeader
-          title="失败记录"
-          description="查看采集失败明细、自动重试次数和最终失败记录，并统一清理已有重试结果或全部失败记录。"
-        />
+      <ManagePageHeader
+        title="失败记录"
+        description="查看采集失败明细、自动重试次数和最终失败记录，并统一清理已有重试结果或全部失败记录。"
+      />
 
       <Space size={[8, 8]} wrap className={styles.filterBar}>
         <Select
-          placeholder="采集来源"
+          placeholder="采集源"
           value={params.originId || undefined}
           onChange={(v) => setParams({ ...params, originId: v })}
           options={options.origin?.map((o: any) => ({
@@ -284,8 +290,10 @@ export default function FailureRecordPageView() {
         />
         <RangePicker
           showTime
+          value={dateRange}
           className={styles.dateRange}
           onChange={(dates) => {
+            setDateRange(dates);
             if (dates && dates[0] && dates[1]) {
               setParams({
                 ...params,
@@ -299,14 +307,38 @@ export default function FailureRecordPageView() {
         />
         <Button
           type="primary"
-          onClick={() => getRecords()}
+          icon={<SearchOutlined />}
+          onClick={() => {
+            const newPage = { ...page, current: 1 };
+            setPage(newPage);
+            void getRecords(newPage, params);
+          }}
           className={styles.searchButton}
         >
-          查询
+          搜索
+        </Button>
+        <Button
+          icon={<ReloadOutlined />}
+          onClick={() => {
+            const defaultParams = {
+              originId: "",
+              status: -1,
+              beginTime: "",
+              endTime: "",
+            };
+            setParams(defaultParams);
+            setDateRange(null);
+            const newPage = { ...page, current: 1 };
+            setPage(newPage);
+            void getRecords(newPage, defaultParams);
+          }}
+        >
+          重置
         </Button>
       </Space>
 
       <Table
+        bordered
         columns={columns}
         dataSource={records}
         rowKey="ID"
@@ -319,13 +351,14 @@ export default function FailureRecordPageView() {
             <div className={styles.tableTitle}>失败记录列表</div>
             <Space size={[8, 8]} wrap className={styles.tableActions}>
               <Popconfirm title="确认立即重试所有待自动重试记录？" onConfirm={handleRetryAll}>
-                <Button type="primary" icon={<ReloadOutlined />}>
+                <Button type="primary" icon={<ReloadOutlined />} disabled={!canWrite}>
                   重试待重试记录
                 </Button>
               </Popconfirm>
               <Popconfirm title="确认清除已有重试结果的记录？" onConfirm={handleCleanResult}>
                 <Button
                   icon={<WarningOutlined />}
+                  disabled={!canWrite}
                   style={{
                     color: "var(--ant-color-warning)",
                     borderColor: "var(--ant-color-warning)",
@@ -335,7 +368,7 @@ export default function FailureRecordPageView() {
                 </Button>
               </Popconfirm>
               <Popconfirm title="确认清除所有记录？" onConfirm={handleCleanAll}>
-                <Button danger icon={<DeleteOutlined />}>
+                <Button danger icon={<DeleteOutlined />} disabled={!canWrite}>
                   清除所有
                 </Button>
               </Popconfirm>

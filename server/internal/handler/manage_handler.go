@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"server/internal/config"
 	"server/internal/model"
 	"server/internal/model/dto"
 	"server/internal/service"
@@ -18,8 +19,18 @@ type ManageHandler struct{}
 
 var ManageHd = new(ManageHandler)
 
+// AdminNotice 后台顶部公告（进入后台即可见）。
+type AdminNotice struct {
+	Level      string `json:"level"` // error | warning | info
+	Code       string `json:"code"`
+	Message    string `json:"message"`
+	ActionPath string `json:"actionPath,omitempty"`
+	ActionText string `json:"actionText,omitempty"`
+}
+
 func (h *ManageHandler) ManageIndex(c *gin.Context) {
-	dto.SuccessOnlyMsg("后台管理中心", c)
+	// notices 预留后台顶部公告；ContentKey 已改为写路径懒兼容，不再在启动时 bulk 迁移。
+	dto.Success(gin.H{"notices": []AdminNotice{}}, "后台管理中心", c)
 }
 
 // ------------------------------------------------------ 站点基本配置 ------------------------------------------------------
@@ -49,13 +60,48 @@ func (h *ManageHandler) UpdateSiteBasic(c *gin.Context) {
 	dto.SuccessOnlyMsg("更新成功", c)
 }
 
-// ResetSiteBasic 重置网站配置信息为初始化状态
+// ResetSiteBasic 重置网站基本信息为默认值（首页轮播已移入内容管理，重置不再清空轮播）
 func (h *ManageHandler) ResetSiteBasic(c *gin.Context) {
 	if err := service.ManageSvc.ResetSiteBasic(); err != nil {
 		dto.Failed(fmt.Sprint("配置信息重置失败: ", err), c)
 		return
 	}
-	dto.SuccessOnlyMsg("配置信息已重置为默认值", c)
+	dto.SuccessOnlyMsg("已还原默认网站配置", c)
+}
+
+// ------------------------------------------------------ 配置备份导入/导出 ------------------------------------------------------
+
+// ExportConfigBackup 导出站点配置备份（不含影视库存与账号）
+func (h *ManageHandler) ExportConfigBackup(c *gin.Context) {
+	dto.Success(service.BackupSvc.ExportConfig(), "配置备份导出成功", c)
+}
+
+// ImportConfigBackup 导入站点配置备份（需管理密码）
+func (h *ManageHandler) ImportConfigBackup(c *gin.Context) {
+	var req model.ConfigBackupImportRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		dto.Failed("请求参数异常", c)
+		return
+	}
+	if !verifyManagePassword(c, req.Password) {
+		dto.Failed("导入失败, 密钥校验失败!!!", c)
+		return
+	}
+	if err := service.BackupSvc.ImportConfig(req); err != nil {
+		dto.Failed(err.Error(), c)
+		return
+	}
+	dto.SuccessOnlyMsg("配置备份导入成功", c)
+}
+
+func verifyManagePassword(c *gin.Context, password string) bool {
+	v, ok := c.Get(config.AuthUserClaims)
+	if !ok {
+		dto.Failed("操作失败,登录信息异常!!!", c)
+		return false
+	}
+	uc := v.(*utils.UserClaims)
+	return service.UserSvc.VerifyUserPassword(uc.UserID, password)
 }
 
 // ------------------------------------------------------ 轮播数据配置 ------------------------------------------------------
@@ -93,7 +139,7 @@ func (h *ManageHandler) BannerAdd(c *gin.Context) {
 	b.Id = utils.GenerateSalt()
 	bl := service.ManageSvc.GetBanners()
 	if len(bl) >= 6 {
-		dto.Failed("Banners最大阈值为6, 无法添加新的banner信息", c)
+		dto.Failed("首页轮播最多支持 6 条，无法继续添加", c)
 		return
 	}
 	bl = append(bl, b)

@@ -1,19 +1,35 @@
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useState } from "react";
-import { Alert, Avatar, Button, Card, Flex, Input, List, Modal, Space, Spin, Switch, Tag, Typography } from "antd";
 import {
-  DeleteOutlined,
+  Avatar,
+  Button,
+  Card,
+  Flex,
+  Input,
+  List,
+  Modal,
+  Space,
+  Spin,
+  Switch,
+  Tag,
+  Typography,
+} from "antd";
+
+import {
   EditOutlined,
   ReloadOutlined,
+  SettingOutlined,
 } from "@ant-design/icons";
 import { ApiGet, ApiPost } from "@/lib/client-api";
 import { useAppMessage } from "@/lib/useAppMessage";
+import { useManagePermission } from "@/lib/manage-permission";
 import ManagePageHeader from "@/app/manage/components/page-header";
 import styles from "./index.module.less";
 
 interface SiteConfigValues {
   siteName: string;
+  siteUrl: string;
   keyword: string;
   logo: string;
   state: boolean;
@@ -27,10 +43,12 @@ interface ConfigItem {
   field: EditableField;
   label: string;
   type: "text" | "textarea" | "switch" | "image";
+  hint?: string;
 }
 
 const DEFAULT_CONFIG: SiteConfigValues = {
   siteName: "",
+  siteUrl: "",
   keyword: "",
   logo: "",
   state: false,
@@ -40,6 +58,12 @@ const DEFAULT_CONFIG: SiteConfigValues = {
 
 const CONFIG_ITEMS: ConfigItem[] = [
   { field: "siteName", label: "网站名称", type: "text" },
+  {
+    field: "siteUrl",
+    label: "网站地址",
+    type: "text",
+    hint: "公网访问根地址，如 https://example.com。用于点击 Logo 跳转，以及 Telegram 通知中的播放链接。",
+  },
   { field: "logo", label: "网站 Logo", type: "image" },
   { field: "keyword", label: "搜索关键字", type: "text" },
   { field: "describe", label: "网站描述", type: "textarea" },
@@ -50,6 +74,7 @@ const CONFIG_ITEMS: ConfigItem[] = [
 function normalizeConfig(data: Partial<SiteConfigValues> | undefined): SiteConfigValues {
   return {
     siteName: String(data?.siteName ?? ""),
+    siteUrl: String(data?.siteUrl ?? "").trim(),
     keyword: String(data?.keyword ?? ""),
     logo: String(data?.logo ?? ""),
     state: Boolean(data?.state),
@@ -66,26 +91,37 @@ function renderPreviewValue(item: ConfigItem, value: SiteConfigValues[EditableFi
     const src = String(value || "").trim();
     if (!src) return <Typography.Text type="secondary">未设置</Typography.Text>;
     return (
-      <Flex align="center" gap={10}>
-        <Avatar src={src} shape="square" size={34} className={styles.logoPreview} />
-        <Typography.Text ellipsis>{src}</Typography.Text>
-      </Flex>
+      <Space size={8} align="center">
+        <Avatar src={src} shape="square" size={32} style={{ borderRadius: 8 }} />
+        <Typography.Text ellipsis style={{ maxWidth: 360 }}>
+          {src}
+        </Typography.Text>
+      </Space>
     );
   }
   const text = String(value || "").trim();
-  return text ? <Typography.Text ellipsis>{text}</Typography.Text> : <Typography.Text type="secondary">未设置</Typography.Text>;
+  return text ? (
+    <Typography.Text ellipsis style={{ maxWidth: 520 }}>
+      {text}
+    </Typography.Text>
+  ) : (
+    <Typography.Text type="secondary">未设置</Typography.Text>
+  );
 }
 
-export default function SiteConfigPageView() {
+interface SiteConfigPageViewProps {
+  /** 嵌入系统设置 Tabs 时隐藏独立页头 */
+  embedded?: boolean;
+}
+
+export default function SiteConfigPageView({ embedded = false }: SiteConfigPageViewProps) {
   const [config, setConfig] = useState<SiteConfigValues>(DEFAULT_CONFIG);
   const [fetching, setFetching] = useState(false);
   const [editingItem, setEditingItem] = useState<ConfigItem | null>(null);
   const [editingValue, setEditingValue] = useState<string | boolean>("");
   const [saving, setSaving] = useState(false);
-  const [resetFilmsOpen, setResetFilmsOpen] = useState(false);
-  const [resetFilmsPassword, setResetFilmsPassword] = useState("");
-  const [resettingFilms, setResettingFilms] = useState(false);
   const { message } = useAppMessage();
+  const { canWrite } = useManagePermission();
 
   const getBasicInfo = useCallback(async () => {
     setFetching(true);
@@ -135,7 +171,7 @@ export default function SiteConfigPageView() {
     try {
       const resp = await ApiPost("/manage/config/basic/reset");
       if (resp.code === 0) {
-        message.success(resp.msg);
+        message.success(resp.msg || "已还原默认基本信息");
         await getBasicInfo();
       } else {
         message.error(resp.msg);
@@ -145,98 +181,89 @@ export default function SiteConfigPageView() {
     }
   };
 
-  const resetFilms = async () => {
-    if (!resetFilmsPassword) {
-      message.error("请输入管理密码");
-      return;
-    }
-    setResettingFilms(true);
-    try {
-      const resp = await ApiPost("/manage/spider/clear", {
-        password: resetFilmsPassword,
-      });
-      if (resp.code === 0) {
-        message.success(resp.msg);
-        setResetFilmsOpen(false);
-        setResetFilmsPassword("");
-        return;
-      }
-      message.error(resp.msg || "重置全站影视数据失败");
-    } finally {
-      setResettingFilms(false);
-    }
-  };
-
-  const editorTitle = useMemo(() => (editingItem ? `编辑${editingItem.label}` : "编辑配置"), [editingItem]);
+  const editorTitle = useMemo(
+    () => (editingItem ? `编辑${editingItem.label}` : "编辑配置"),
+    [editingItem],
+  );
 
   useEffect(() => {
     void getBasicInfo();
   }, [getBasicInfo]);
 
+  const resetAction = (
+    <Button icon={<ReloadOutlined />} loading={fetching} onClick={() => void handleReset()}>
+      还原默认
+    </Button>
+  );
+
   return (
     <div className={styles.formPanel}>
-      <ManagePageHeader
-        title="网站配置"
-        description="集中维护站点名称、描述、Logo 与站点可用状态等基础信息。"
-        actions={
-          <Button icon={<ReloadOutlined />} loading={fetching} onClick={handleReset}>
-            重置配置
-          </Button>
-        }
-      />
+      {embedded ? null : (
+        <ManagePageHeader
+          title="网站配置"
+          description="维护站点基本信息；还原将恢复默认基本信息。"
+          actions={resetAction}
+        />
+      )}
 
       <Spin spinning={fetching} description="正在加载网站配置...">
-        <Card size="small">
+        <Card
+          title={
+            <Space size={8}>
+              <SettingOutlined style={{ color: "#1677ff" }} />
+              <span>基本信息</span>
+            </Space>
+          }
+          extra={embedded ? resetAction : null}
+          className={styles.card}
+          styles={{ body: { padding: "8px 16px" } }}
+        >
           <List
+            itemLayout="horizontal"
             dataSource={CONFIG_ITEMS}
+            split
             renderItem={(item) => (
               <List.Item
+                style={{ padding: "16px 0" }}
                 actions={[
                   <Button
                     key="edit"
-                    type="text"
+                    type="link"
                     icon={<EditOutlined />}
+                    disabled={!canWrite}
                     onClick={() => openEditor(item)}
                   >
                     编辑
                   </Button>,
                 ]}
               >
-                <List.Item.Meta
-                  title={item.label}
-                  description={renderPreviewValue(item, config[item.field])}
-                />
+                <Space direction="vertical" size={4} className={styles.configMeta}>
+                  <Typography.Text strong>{item.label}</Typography.Text>
+                  <div className={styles.configValue}>{renderPreviewValue(item, config[item.field])}</div>
+                  {item.hint ? (
+                    <Typography.Text type="secondary" className={styles.configHint}>
+                      {item.hint}
+                    </Typography.Text>
+                  ) : null}
+                </Space>
               </List.Item>
             )}
           />
         </Card>
       </Spin>
 
-      <Card size="small" title="危险操作" className={styles.dangerCard}>
-        <Flex justify="space-between" align="center" gap={16} wrap="wrap">
-          <Space direction="vertical" size={4} className={styles.dangerText}>
-            <Typography.Text type="danger" strong>恢复全站默认值</Typography.Text>
-            <Typography.Text type="secondary">
-              清空影视与采集派生数据，并恢复默认配置、默认账号、默认采集源、默认定时任务、默认轮播和主站原始分类。
-            </Typography.Text>
-          </Space>
-          <Button danger icon={<DeleteOutlined />} onClick={() => setResetFilmsOpen(true)}>
-            恢复默认值
-          </Button>
-        </Flex>
-      </Card>
-
       <Modal
         title={editorTitle}
         open={Boolean(editingItem)}
         onCancel={closeEditor}
+        okButtonProps={{ disabled: !canWrite }}
         onOk={() => void saveEditingItem()}
         okText="保存"
         confirmLoading={saving}
         destroyOnHidden
       >
         {editingItem?.type === "switch" ? (
-          <Flex align="center" justify="space-between" className={styles.switchEditor}>
+          <Flex align="center" justify="space-between" style={{ minHeight: 48 }}>
             <Typography.Text>{editingItem.label}</Typography.Text>
             <Switch
               checked={Boolean(editingValue)}
@@ -257,34 +284,6 @@ export default function SiteConfigPageView() {
             onChange={(event) => setEditingValue(event.target.value)}
           />
         )}
-      </Modal>
-
-      <Modal
-        title="恢复全站默认值"
-        open={resetFilmsOpen}
-        onCancel={() => {
-          setResetFilmsOpen(false);
-          setResetFilmsPassword("");
-        }}
-        onOk={() => void resetFilms()}
-        okText="确认恢复默认值"
-        confirmLoading={resettingFilms}
-        okButtonProps={{ danger: true }}
-        destroyOnHidden
-      >
-        <Flex vertical gap={12}>
-          <Alert
-            showIcon
-            type="error"
-            message="该操作不可逆"
-            description="会停止采集任务，清空影视库存、快照、播放源、分类映射、失败记录等采集派生数据，并恢复系统默认网站配置、内置账号、默认采集源、默认定时任务、默认轮播和主站原始分类。"
-          />
-          <Input.Password
-            placeholder="请输入管理密码"
-            value={resetFilmsPassword}
-            onChange={(event) => setResetFilmsPassword(event.target.value)}
-          />
-        </Flex>
       </Modal>
     </div>
   );

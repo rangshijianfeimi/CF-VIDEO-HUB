@@ -1,21 +1,33 @@
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
 import { Button, Card, Input, Select, Space, Switch, Tag, Typography } from "antd";
-import { ClearOutlined, CopyOutlined, PauseCircleOutlined, PlayCircleOutlined, ReloadOutlined } from "@ant-design/icons";
+import { ClearOutlined, CopyOutlined, FileTextOutlined, PauseCircleOutlined, PlayCircleOutlined, ReloadOutlined, SearchOutlined } from "@ant-design/icons";
 import { ApiGet } from "@/lib/client-api";
 import { useAppMessage } from "@/lib/useAppMessage";
 import ManagePageHeader from "@/app/manage/components/page-header";
 import styles from "./index.module.less";
+
+interface SystemLogsPageViewProps {
+  /** 嵌入系统设置 Tabs 时隐藏独立页头 */
+  embedded?: boolean;
+}
+
 
 const INITIAL_LOG_LINES = 500;
 const MAX_LOG_LINES = 1000;
 const DELTA_LOG_LIMIT = 10000;
 const POLLING_INTERVAL_MS = 1000;
 
+/** 服务端写入时确定的级别；前端只读该字段，禁止按正文猜。 */
+type LogLevel = "info" | "warn" | "error";
+
 interface LogEntry {
   seq: number;
   line: string;
+  /** info | warn | error，缺省按 info */
+  level?: string;
 }
 
 interface DeltaLogsResponse {
@@ -25,40 +37,37 @@ interface DeltaLogsResponse {
   expired: boolean;
 }
 
-function appendBoundedLines(prev: string[], incoming: string[]) {
+function normalizeLevel(level?: string): LogLevel {
+  const v = (level || "").toLowerCase().trim();
+  if (v === "error" || v === "err" || v === "fatal" || v === "panic") return "error";
+  if (v === "warn" || v === "warning") return "warn";
+  return "info";
+}
+
+function appendBoundedEntries(prev: LogEntry[], incoming: LogEntry[]) {
   if (incoming.length === 0) return prev;
   const next = [...prev, ...incoming];
   if (next.length <= MAX_LOG_LINES) return next;
   return next.slice(next.length - MAX_LOG_LINES);
 }
 
-function detectLevel(line: string) {
-  const text = line.toLowerCase();
-  if (text.includes("panic") || text.includes("fatal") || text.includes("error") || text.includes("失败")) {
-    return "error";
-  }
-  if (text.includes("warn") || text.includes("warning") || text.includes("跳过")) {
-    return "warn";
-  }
-  return "info";
-}
-
-function levelTag(level: string) {
+function levelTag(level: LogLevel) {
   if (level === "error") return <Tag color="error">ERROR</Tag>;
   if (level === "warn") return <Tag color="warning">WARN</Tag>;
   return <Tag color="processing">INFO</Tag>;
 }
 
-export default function SystemLogsPageView() {
-  const [lines, setLines] = useState<string[]>([]);
+export default function SystemLogsPageView({ embedded = false }: SystemLogsPageViewProps) {
+  const [entries, setEntries] = useState<LogEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [refreshError, setRefreshError] = useState(false);
   const [cursorExpired, setCursorExpired] = useState(false);
   const [lastReceivedAt, setLastReceivedAt] = useState("");
   const [autoScroll, setAutoScroll] = useState(true);
+  const [inputKeyword, setInputKeyword] = useState("");
   const [keyword, setKeyword] = useState("");
-  const [level, setLevel] = useState("all");
+  const [level, setLevel] = useState<string>("all");
   const logBodyRef = useRef<HTMLDivElement | null>(null);
   const cursorRef = useRef(0);
   const deltaFetchingRef = useRef(false);
@@ -69,11 +78,11 @@ export default function SystemLogsPageView() {
     try {
       const resp = await ApiGet<DeltaLogsResponse>("/manage/system/logs/delta", { lines: INITIAL_LOG_LINES });
       if (resp.code === 0) {
-        const entries = resp.data.entries || [];
+        const list = resp.data.entries || [];
         cursorRef.current = resp.data.nextSeq || 0;
         setCursorExpired(false);
         setRefreshError(false);
-        setLines(entries.map((entry) => entry.line));
+        setEntries(list);
         return;
       }
       message.error(resp.msg);
@@ -101,21 +110,25 @@ export default function SystemLogsPageView() {
           setRefreshError(true);
           return;
         }
-        const entries = resp.data.entries || [];
+        const list = resp.data.entries || [];
         setRefreshError(false);
         if (resp.data.expired) {
           const minSeq = resp.data.minSeq ?? 0;
-          const notice = `[SystemLog] 日志游标已过期，已从当前缓冲区最早序号 ${minSeq} 重新加载，过期窗口内日志可能已被截断`;
+          const notice: LogEntry = {
+            seq: -1,
+            level: "warn",
+            line: `[SystemLog] 日志游标已过期，已从当前缓冲区最早序号 ${minSeq} 重新加载，过期窗口内日志可能已被截断`,
+          };
           cursorRef.current = resp.data.nextSeq || cursorRef.current;
           setCursorExpired(true);
-          setLines([notice, ...entries.map((entry) => entry.line)].slice(-MAX_LOG_LINES));
+          setEntries([notice, ...list].slice(-MAX_LOG_LINES));
           setLastReceivedAt(new Date().toLocaleTimeString());
           return;
         }
         cursorRef.current = resp.data.nextSeq || cursorRef.current;
         setCursorExpired(false);
-        setLines((prev) => appendBoundedLines(prev, entries.map((entry) => entry.line)));
-        if (entries.length > 0) {
+        setEntries((prev) => appendBoundedEntries(prev, list));
+        if (list.length > 0) {
           setLastReceivedAt(new Date().toLocaleTimeString());
         }
       } catch {
@@ -131,24 +144,24 @@ export default function SystemLogsPageView() {
     };
   }, [autoRefresh]);
 
-  const filteredLines = useMemo(() => {
+  const filteredEntries = useMemo(() => {
     const word = keyword.trim().toLowerCase();
-    return lines.filter((line) => {
-      if (level !== "all" && detectLevel(line) !== level) return false;
-      if (word && !line.toLowerCase().includes(word)) return false;
+    return entries.filter((entry) => {
+      if (level !== "all" && normalizeLevel(entry.level) !== level) return false;
+      if (word && !entry.line.toLowerCase().includes(word)) return false;
       return true;
     });
-  }, [keyword, level, lines]);
+  }, [keyword, level, entries]);
 
   useEffect(() => {
     if (!autoScroll) return;
     const el = logBodyRef.current;
     if (!el) return;
     el.scrollTop = el.scrollHeight;
-  }, [autoScroll, filteredLines.length]);
+  }, [autoScroll, filteredEntries.length]);
 
   const copyLogs = async () => {
-    await navigator.clipboard.writeText(filteredLines.join("\n"));
+    await navigator.clipboard.writeText(filteredEntries.map((e) => e.line).join("\n"));
     message.success("已复制当前展示日志");
   };
 
@@ -161,12 +174,14 @@ export default function SystemLogsPageView() {
 
   return (
     <div className={styles.pageStack}>
-      <div className={styles.headerArea}>
-        <ManagePageHeader
-          title="系统日志"
-          description="查看服务端日志并按游标增量刷新；页面打开期间不会静默漏日志，前端最多展示最近 1000 行。"
-        />
-      </div>
+      {embedded ? null : (
+        <div className={styles.headerArea}>
+          <ManagePageHeader
+            title="系统日志"
+            description="级别由服务端写入时确定并随接口下发；页面打开期间按游标增量刷新，前端最多展示最近 1000 行。"
+          />
+        </div>
+      )}
 
       <Card className={styles.filterCard}>
         <Space size={[8, 8]} wrap className={styles.toolbar}>
@@ -180,19 +195,43 @@ export default function SystemLogsPageView() {
           >
             {autoRefresh ? "暂停刷新" : "恢复刷新"}
           </Button>
-          <Button icon={<ClearOutlined />} onClick={() => setLines([])}>
+          <Button icon={<ClearOutlined />} onClick={() => setEntries([])}>
             清空显示
           </Button>
-          <Button icon={<CopyOutlined />} onClick={copyLogs} disabled={filteredLines.length === 0}>
+          <Button icon={<CopyOutlined />} onClick={copyLogs} disabled={filteredEntries.length === 0}>
             复制当前日志
           </Button>
-          <Input.Search
+          <Input
             allowClear
             placeholder="关键词过滤"
             className={styles.keywordInput}
-            value={keyword}
-            onChange={(event) => setKeyword(event.target.value)}
+            value={inputKeyword}
+            onChange={(event) => {
+              const val = event.target.value;
+              setInputKeyword(val);
+              if (val === "" && keyword !== "") {
+                setKeyword("");
+              }
+            }}
+            onPressEnter={() => setKeyword(inputKeyword.trim())}
           />
+          <Button
+            type="primary"
+            icon={<SearchOutlined />}
+            onClick={() => setKeyword(inputKeyword.trim())}
+          >
+            搜索
+          </Button>
+          <Button
+            icon={<ReloadOutlined />}
+            onClick={() => {
+              setInputKeyword("");
+              setKeyword("");
+              setLevel("all");
+            }}
+          >
+            重置
+          </Button>
           <Select
             className={styles.levelSelect}
             value={level}
@@ -212,30 +251,36 @@ export default function SystemLogsPageView() {
       </Card>
 
       <Card
-        title="日志输出"
+        title={
+          <Space>
+            <FileTextOutlined style={{ color: "#1677ff" }} />
+            <span>日志输出</span>
+          </Space>
+        }
         styles={{ body: { display: "flex", flex: 1, minHeight: 0, padding: 12 } }}
         extra={(
           <Space size={[8, 8]} wrap>
             {renderRefreshStatus()}
             {lastReceivedAt && <Tag>最后接收 {lastReceivedAt}</Tag>}
             <Tag>游标 {cursorRef.current}</Tag>
-            <Tag>缓存 {lines.length}/{MAX_LOG_LINES} 行</Tag>
-            <Tag>展示 {filteredLines.length} 行</Tag>
+            <Tag>缓存 {entries.length}/{MAX_LOG_LINES} 行</Tag>
+            <Tag>展示 {filteredEntries.length} 行</Tag>
           </Space>
         )}
         className={styles.logCard}
       >
+
         <div ref={logBodyRef} className={styles.logBody}>
-          {filteredLines.length === 0 ? (
+          {filteredEntries.length === 0 ? (
             <Typography.Text type="secondary">暂无匹配日志</Typography.Text>
           ) : (
-            filteredLines.map((line, index) => {
-              const logLevel = detectLevel(line);
+            filteredEntries.map((entry, index) => {
+              const logLevel = normalizeLevel(entry.level);
               return (
-                <div key={`${index}-${line}`} className={styles.logLine}>
+                <div key={`${entry.seq}-${index}`} className={styles.logLine}>
                   <span className={styles.lineNo}>{index + 1}</span>
                   <span className={styles.level}>{levelTag(logLevel)}</span>
-                  <span className={styles.message}>{line}</span>
+                  <span className={styles.message}>{entry.line}</span>
                 </div>
               );
             })

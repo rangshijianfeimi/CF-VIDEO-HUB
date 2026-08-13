@@ -1,6 +1,7 @@
 package router
 
 import (
+	"mime"
 	"server/internal/config"
 	"server/internal/handler"
 	"server/internal/middleware"
@@ -9,6 +10,10 @@ import (
 )
 
 func SetupRouter() *gin.Engine {
+	// 部分运行环境系统 mime 库可能缺失 webp/ico，主动注册保证图库可渲染
+	_ = mime.AddExtensionType(".webp", "image/webp")
+	_ = mime.AddExtensionType(".ico", "image/x-icon")
+
 	r := gin.New()
 	r.Use(middleware.AccessLog())
 	r.Use(gin.Recovery())
@@ -42,6 +47,14 @@ func SetupRouter() *gin.Engine {
 			sysConfig.GET(`/basic`, handler.ManageHd.SiteBasicConfig)
 			sysConfig.POST(`/basic/update`, handler.ManageHd.UpdateSiteBasic)
 			sysConfig.POST(`/basic/reset`, handler.ManageHd.ResetSiteBasic)
+
+			sysConfig.GET(`/notify`, handler.NotifyHd.GetNotifyConfig)
+			sysConfig.POST(`/notify/update`, handler.NotifyHd.UpdateNotifyConfig)
+			sysConfig.POST(`/notify/test`, handler.NotifyHd.TestNotify)
+
+			// 配置备份：导出/导入（不含影视库存与账号）
+			sysConfig.GET(`/backup/export`, handler.ManageHd.ExportConfigBackup)
+			sysConfig.POST(`/backup/import`, handler.ManageHd.ImportConfigBackup)
 		}
 		systemLog := manageRoute.Group(`/system/logs`)
 		{
@@ -91,6 +104,8 @@ func SetupRouter() *gin.Engine {
 			collect.POST(`/change`, handler.CollectHd.FilmSourceChange)
 			collect.POST(`/change/batch`, handler.CollectHd.FilmSourceBatchChange)
 			collect.POST(`/del`, handler.CollectHd.FilmSourceDel)
+			collect.POST(`/del/batch`, handler.CollectHd.FilmSourceDelBatch)
+			collect.POST(`/check/all`, handler.CollectHd.FilmSourceCheckAll)
 			collect.GET(`/options`, handler.CollectHd.GetNormalFilmSource)
 
 			collect.GET(`/record/list`, handler.CollectHd.FailureRecordList)
@@ -114,7 +129,10 @@ func SetupRouter() *gin.Engine {
 		spiderRoute := manageRoute.Group(`/spider`)
 		{
 			spiderRoute.POST(`/start`, handler.SpiderHd.StarSpider)
+			spiderRoute.POST(`/stop`, handler.SpiderHd.StopTask)
 			spiderRoute.POST(`/clear`, handler.SpiderHd.ClearAllFilm)
+			spiderRoute.GET(`/clear/progress`, handler.SpiderHd.ResetProgress)
+			spiderRoute.GET(`/clear/stats`, handler.SpiderHd.ResetImpactStats)
 			spiderRoute.POST(`/update/single`, handler.SpiderHd.SingleUpdateSpider)
 			spiderRoute.POST(`/stopAll`, handler.SpiderHd.StopAllTasks)
 		}
@@ -138,6 +156,7 @@ func SetupRouter() *gin.Engine {
 		{
 			fileRoute.POST(`/upload`, handler.FileHd.SingleUpload)
 			fileRoute.POST(`/upload/multiple`, handler.FileHd.MultipleUpload)
+			fileRoute.POST(`/rename`, handler.FileHd.RenameFile)
 			fileRoute.POST(`/del`, handler.FileHd.DelFile)
 			fileRoute.GET(`/list`, handler.FileHd.PhotoWall)
 		}

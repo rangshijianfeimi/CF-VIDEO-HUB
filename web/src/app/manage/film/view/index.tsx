@@ -13,6 +13,7 @@ import {
   Tooltip,
   Pagination,
   Typography,
+  Card,
 } from "antd";
 import { useRouter } from "next/navigation";
 import {
@@ -28,6 +29,7 @@ import type { ColumnsType } from "antd/es/table";
 import { ApiGet, ApiPost } from "@/lib/client-api";
 import dayjs from "dayjs";
 import { useAppMessage } from "@/lib/useAppMessage";
+import { useManagePermission } from "@/lib/manage-permission";
 import ManagePageHeader from "@/app/manage/components/page-header";
 import { resolvePlayEntryPath } from "@/lib/playNavigation";
 import styles from "./index.module.less";
@@ -49,6 +51,7 @@ interface FilmItem {
 
 export default function FilmListPageView() {
   const router = useRouter();
+  const { canWrite } = useManagePermission();
   const [list, setList] = useState<FilmItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [syncingIds, setSyncingIds] = useState<number[]>([]);
@@ -77,12 +80,13 @@ export default function FilmListPageView() {
   const { message } = useAppMessage();
 
   const getFilmPage = useCallback(
-    async (p?: any) => {
+    async (p?: any, overrideParams?: any) => {
       setLoading(true);
       const pg = p || page;
+      const reqParams = overrideParams || params;
       try {
         const resp = await ApiGet("/manage/film/search/list", {
-          ...params,
+          ...reqParams,
           current: pg.current,
           pageSize: pg.pageSize,
         });
@@ -164,8 +168,35 @@ export default function FilmListPageView() {
       p.endTime = "";
     }
     setParams(p);
-    setPage({ ...page, current: 1 });
-    getFilmPage({ ...page, current: 1 });
+    const newPage = { ...page, current: 1 };
+    setPage(newPage);
+    void getFilmPage(newPage, p);
+  };
+
+  const onReset = () => {
+    const emptyParams = {
+      name: "",
+      pid: 0,
+      cid: 0,
+      plot: "",
+      area: "",
+      language: "",
+      year: "",
+      beginTime: "",
+      endTime: "",
+    };
+    setParams(emptyParams);
+    setClassId(0);
+    setDateRange(null);
+    setOptions((prev: any) => ({
+      ...prev,
+      Plot: [],
+      Area: [],
+      Language: [],
+    }));
+    const newPage = { ...page, current: 1 };
+    setPage(newPage);
+    void getFilmPage(newPage, emptyParams);
   };
 
   const handleUpdateSingle = useCallback(
@@ -320,6 +351,7 @@ export default function FilmListPageView() {
                     className={`${styles.syncIcon} ${syncingIds.includes(record.mid) ? styles.syncing : ""}`}
                   />
                 }
+                disabled={!canWrite}
                 onClick={() => handleUpdateSingle(record.mid)}
               />
             </Tooltip>
@@ -330,6 +362,7 @@ export default function FilmListPageView() {
                 size="small"
                 style={{ background: "#1890ff", borderColor: "#1890ff" }}
                 icon={<EditOutlined />}
+                disabled={!canWrite}
                 onClick={() => router.push(`/manage/film/add?id=${record.mid}`)}
               />
             </Tooltip>
@@ -344,6 +377,7 @@ export default function FilmListPageView() {
                   shape="circle"
                   size="small"
                   icon={<DeleteOutlined />}
+                  disabled={!canWrite}
                 />
               </Tooltip>
             </Popconfirm>
@@ -351,7 +385,7 @@ export default function FilmListPageView() {
         ),
       },
     ],
-    [syncingIds, router, handleDelFilm, handleUpdateSingle],
+    [syncingIds, router, handleDelFilm, handleUpdateSingle, canWrite],
   );
 
   return (
@@ -409,12 +443,16 @@ export default function FilmListPageView() {
           onChange={(v) => setDateRange(v)}
           className={styles.dateRange}
         />
-        <Button type="primary" onClick={onSearch} className={styles.searchButton}>
+        <Button type="primary" icon={<SearchOutlined />} onClick={onSearch} className={styles.searchButton}>
           搜索
+        </Button>
+        <Button icon={<ReloadOutlined />} onClick={onReset}>
+          重置
         </Button>
       </Space>
 
       <Table
+        bordered
         columns={columns}
         dataSource={list}
         rowKey="mid"
@@ -429,6 +467,7 @@ export default function FilmListPageView() {
               <Button
                 type="primary"
                 icon={<PlusOutlined />}
+                disabled={!canWrite}
                 onClick={() => router.push("/manage/film/add")}
               >
                 新增影视

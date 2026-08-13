@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"time"
@@ -10,6 +9,7 @@ import (
 	"server/internal/config"
 	"server/internal/infra/db"
 	"server/internal/infra/syslog"
+	"server/internal/notify"
 	"server/internal/router"
 	"server/internal/service"
 
@@ -28,13 +28,16 @@ func init() {
 
 func setupLogging() {
 	if err := syslog.Init(); err != nil {
+		// Init 失败时仍打到 stdout，避免完全静默
+		log.SetOutput(os.Stdout)
 		log.Printf("[Init] 系统日志初始化失败: %v", err)
 		return
 	}
-	writer := io.MultiWriter(os.Stdout, syslog.Writer())
-	log.SetOutput(writer)
-	gin.DefaultWriter = writer
-	gin.DefaultErrorWriter = writer
+	// 级别在写入时确定：默认 log/gin 输出为 INFO；gin 错误流为 ERROR。
+	// syslog.Writer 内部已镜像 stdout + 落盘，勿再套 MultiWriter 以免双写。
+	log.SetOutput(syslog.Writer())
+	gin.DefaultWriter = syslog.Writer()
+	gin.DefaultErrorWriter = syslog.LevelWriter(syslog.LevelError)
 }
 
 func waitForRedis(maxRetries int, interval time.Duration) error {
@@ -70,10 +73,14 @@ func main() {
 }
 
 func start() {
+	log.Printf("[Init] EcoHub server version=%s", config.Version)
+
 	db.StartRedisHealthCheck()
 	db.StartMysqlHealthCheck()
 
 	service.InitSvc.DefaultDataInit()
+	// Telegram：/search 指令 + 更新列表翻页（需已配置 Bot Token）
+	notify.EnsureBotPoller()
 
 	r := router.SetupRouter()
 	_ = r.Run(fmt.Sprintf(":%s", config.ListenerPort))

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"server/internal/config"
 	"server/internal/infra/db"
@@ -36,9 +37,11 @@ var searchTagsVisibleCacheState struct {
 
 var movieSourceMappingWriteMu sync.Mutex
 
-func filmIndexContentKeyUpsert() clause.OnConflict {
+// filmIndexMidUpsert 按 mid 冲突更新（主站 mid = 源站 vod_id）。
+// 旧库存 content_key=name_* 时仍能命中同一行，并在更新时懒升 content_key→vod_*。
+func filmIndexMidUpsert() clause.OnConflict {
 	return clause.OnConflict{
-		Columns:   []clause.Column{{Name: "content_key"}},
+		Columns:   []clause.Column{{Name: "mid"}},
 		DoUpdates: clause.AssignmentColumns(filmIndexUpsertUpdateColumns),
 	}
 }
@@ -69,10 +72,58 @@ func upsertFilmIndexesTx(tx *gorm.DB, list []model.FilmIndex) error {
 	if len(list) == 0 {
 		return nil
 	}
+	// 软删占键可安全释放；活跃行占键则报错，避免生产误改他片身份键。
+	if err := releaseConflictingContentKeysTx(tx, list); err != nil {
+		return err
+	}
 	sort.Slice(list, func(i, j int) bool {
-		return list[i].ContentKey < list[j].ContentKey
+		return list[i].Mid < list[j].Mid
 	})
-	return tx.Clauses(filmIndexContentKeyUpsert()).CreateInBatches(&list, upsertBatchSize).Error
+	return tx.Clauses(filmIndexMidUpsert()).CreateInBatches(&list, upsertBatchSize).Error
+}
+
+// releaseConflictingContentKeysTx 处理 content_key=目标 且 mid≠本批归属 的占用行：
+//   - 软删行：改名为 del_{id}，释放唯一键（常见、安全）；
+//   - 活跃行：直接报错，不自动抢键（脏数据需人工处理，避免写坏库存）。
+func releaseConflictingContentKeysTx(tx *gorm.DB, list []model.FilmIndex) error {
+	for _, item := range list {
+		key := strings.TrimSpace(item.ContentKey)
+		if key == "" || item.Mid <= 0 {
+			continue
+		}
+		var occupants []model.FilmIndex
+		if err := tx.Unscoped().Model(&model.FilmIndex{}).
+			Select("id", "mid", "deleted_at").
+			Where("content_key = ? AND mid <> ?", key, item.Mid).
+			Find(&occupants).Error; err != nil {
+			return err
+		}
+		for _, o := range occupants {
+			if !o.DeletedAt.Valid {
+				return fmt.Errorf("content_key %q 已被活跃 mid=%d 占用，无法写入 mid=%d（请检查脏数据或重置冲突片）",
+					key, o.Mid, item.Mid)
+			}
+			if err := tx.Unscoped().Model(&model.FilmIndex{}).
+				Where("id = ?", o.ID).
+				Update("content_key", fmt.Sprintf("del_%d", o.ID)).Error; err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// keyToMidFromIndexes 主站 mid 即全局 mid，映射可直接由本批索引构造（不依赖 DB content_key 是否已懒升）。
+func keyToMidFromIndexes(list []model.FilmIndex) map[string]int64 {
+	out := make(map[string]int64, len(list))
+	for _, item := range list {
+		key := strings.TrimSpace(item.ContentKey)
+		if key == "" || item.Mid <= 0 {
+			continue
+		}
+		out[key] = item.Mid
+	}
+	return out
 }
 
 func loadFilmIndexMidMapByContentKeys(contentKeys []string) map[string]int64 {
@@ -133,8 +184,8 @@ func saveFilmIndexesAndMappingsTx(tx *gorm.DB, list []model.FilmIndex) (map[stri
 		return nil, err
 	}
 
-	keyToMid := loadFilmIndexMidMapByContentKeysTx(tx, buildContentKeys(list))
-	if keyToMid == nil {
+	keyToMid := keyToMidFromIndexes(list)
+	if len(keyToMid) == 0 {
 		return nil, fmt.Errorf("load film index mids failed")
 	}
 	if err := saveMovieSourceMappingsTxE(tx, buildMovieSourceMappings(list, keyToMid)); err != nil {
@@ -177,33 +228,34 @@ func buildFilmIndexesFromDetails(sourceID string, details []model.MovieDetail) (
 	return infoList, infoByKey, nil
 }
 
-func applyMasterBusinessUpdateStampsTx(tx *gorm.DB, infos []model.FilmIndex, detailsByKey map[string]model.MovieDetail) (map[string]struct{}, error) {
+func applyMasterBusinessUpdateStampsTx(tx *gorm.DB, infos []model.FilmIndex, detailsByKey map[string]model.MovieDetail) (map[string]struct{}, map[int64]model.MovieDetail, error) {
 	unchangedKeys := make(map[string]struct{})
-	contentKeys := filmIndexContentKeys(infos)
-	if len(contentKeys) == 0 {
-		return unchangedKeys, nil
+	oldDetailsByMid := make(map[int64]model.MovieDetail)
+	// 按 mid 命中旧行：兼容 content_key 仍为 name_* 的库存（无需 bulk 迁移）。
+	mids := filmIndexMIDs(infos)
+	if len(mids) == 0 {
+		return unchangedKeys, oldDetailsByMid, nil
 	}
 
-	existingInfos := reloadFilmIndexesByContentKeysTx(tx, contentKeys)
+	existingInfos := reloadFilmIndexesByMidsTx(tx, mids)
 	if len(existingInfos) == 0 {
-		return unchangedKeys, nil
+		return unchangedKeys, oldDetailsByMid, nil
 	}
 	changedAt := time.Now().Unix()
-	existingByKey := make(map[string]model.FilmIndex, len(existingInfos))
-	mids := make([]int64, 0, len(existingInfos))
+	existingByMid := make(map[int64]model.FilmIndex, len(existingInfos))
 	for _, existing := range existingInfos {
-		existingByKey[existing.ContentKey] = existing
 		if existing.Mid > 0 {
-			mids = append(mids, existing.Mid)
+			existingByMid[existing.Mid] = existing
 		}
 	}
 
 	existingDetailsByMid, err := loadMovieDetailsByMidsTx(tx, mids)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	oldDetailsByMid = existingDetailsByMid
 	for index := range infos {
-		existing, ok := existingByKey[infos[index].ContentKey]
+		existing, ok := existingByMid[infos[index].Mid]
 		if !ok || existing.UpdateStamp <= 0 {
 			continue
 		}
@@ -217,12 +269,16 @@ func applyMasterBusinessUpdateStampsTx(tx *gorm.DB, infos []model.FilmIndex, det
 		}
 		applyPersistedMasterCategory(&infos[index], existing)
 		if sameStoredMasterDetail(oldDetail, newDetail) {
+			// 业务无变更但 content_key 仍为 name_* 等旧值：强制写一次完成懒升（重采即升 vod_*）。
+			if strings.TrimSpace(existing.ContentKey) != strings.TrimSpace(infos[index].ContentKey) {
+				continue
+			}
 			unchangedKeys[infos[index].ContentKey] = struct{}{}
 			continue
 		}
 		infos[index].UpdateStamp = changedAt
 	}
-	return unchangedKeys, nil
+	return unchangedKeys, oldDetailsByMid, nil
 }
 
 func loadMovieDetailsByMidsTx(tx *gorm.DB, mids []int64) (map[int64]model.MovieDetail, error) {
@@ -245,32 +301,115 @@ func loadMovieDetailsByMidsTx(tx *gorm.DB, mids []int64) (map[int64]model.MovieD
 	return result, nil
 }
 
+// sameStoredMasterDetail 判断主站详情是否「业务上无实质变更」。
+// 不可用整份 JSON 全量对比：源站每次采集常变 Hits/UpdateTime/AddTime/DbScore 等噪声字段，
+// 会导致连续采集把同一批片反复当成「有更新」。
 func sameStoredMasterDetail(oldDetail model.MovieDetail, newDetail model.MovieDetail) bool {
-	oldDetail.Id = 0
-	newDetail.Id = 0
-	oldData, _ := json.Marshal(oldDetail)
-	newData, _ := json.Marshal(newDetail)
-	return string(oldData) == string(newData)
+	return masterBusinessSignature(oldDetail) == masterBusinessSignature(newDetail)
 }
 
 func applyPersistedMasterCategory(newInfo *model.FilmIndex, existing model.FilmIndex) {
 	newInfo.FilmIndexCategory = existing.FilmIndexCategory
 }
 
-func masterEpisodeSignature(detail model.MovieDetail) string {
+// masterBusinessSignature 业务变更指纹：片名/副标/封面/播放源/备注/状态/演职/年代地区/分类。
+// 有意不纳入：Hits/UpdateTime/AddTime/DbScore（噪声）；Content/PictureSlide/Language/EnName
+// （简介/横图等变更不进采集更新列表，避免刷屏）。封面只比 path（忽略 CDN query）。
+// 片名参与指纹前做归一化：源站片名标点/空白不稳定（如「烬九州：第四季」↔「烬九州第四季」）
+// 不应视为内容更新；片名实质变化（改名）仍会触发。
+func masterBusinessSignature(detail model.MovieDetail) string {
 	payload := struct {
+		Name     string                 `json:"name"`
+		SubTitle string                 `json:"subTitle"`
+		Picture  string                 `json:"picture"`
 		PlayFrom []string               `json:"playFrom"`
 		PlayList [][]model.MovieUrlInfo `json:"playList"`
 		Remarks  string                 `json:"remarks"`
 		State    string                 `json:"state"`
+		Actor    string                 `json:"actor"`
+		Director string                 `json:"director"`
+		Year     string                 `json:"year"`
+		Area     string                 `json:"area"`
+		ClassTag string                 `json:"classTag"`
 	}{
-		PlayFrom: detail.PlayFrom,
-		PlayList: detail.PlayList,
+		Name:     normalizeNameForCompare(detail.Name),
+		SubTitle: strings.TrimSpace(detail.SubTitle),
+		Picture:  stripURLQuery(detail.Picture),
+		PlayFrom: normalizeStringSlice(detail.PlayFrom),
+		PlayList: normalizePlayList(detail.PlayList),
 		Remarks:  strings.TrimSpace(detail.Remarks),
 		State:    strings.TrimSpace(detail.State),
+		Actor:    strings.TrimSpace(detail.Actor),
+		Director: strings.TrimSpace(detail.Director),
+		Year:     strings.TrimSpace(detail.Year),
+		Area:     strings.TrimSpace(detail.Area),
+		ClassTag: strings.TrimSpace(detail.ClassTag),
 	}
 	data, _ := json.Marshal(payload)
 	return string(data)
+}
+
+func normalizeStringSlice(in []string) []string {
+	if len(in) == 0 {
+		return []string{}
+	}
+	out := make([]string, len(in))
+	for i, s := range in {
+		out[i] = strings.TrimSpace(s)
+	}
+	return out
+}
+
+// normalizeNameForCompare 片名归一化用于变更对比：去空白与标点符号（全半角统一）。
+// 仅用于指纹对比，不影响实际保存/展示的片名。
+func normalizeNameForCompare(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if unicode.IsSpace(r) || unicode.IsPunct(r) {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+func stripURLQuery(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if i := strings.IndexByte(raw, '?'); i >= 0 {
+		return raw[:i]
+	}
+	return raw
+}
+
+func normalizePlayList(in [][]model.MovieUrlInfo) [][]model.MovieUrlInfo {
+	if len(in) == 0 {
+		return [][]model.MovieUrlInfo{}
+	}
+	out := make([][]model.MovieUrlInfo, len(in))
+	for i, group := range in {
+		if len(group) == 0 {
+			out[i] = []model.MovieUrlInfo{}
+			continue
+		}
+		g := make([]model.MovieUrlInfo, len(group))
+		for j, u := range group {
+			g[j] = model.MovieUrlInfo{
+				Episode: strings.TrimSpace(u.Episode),
+				// 链接去 query：防盗链签名等动态参数每次采集都不同，不应视为业务更新
+				Link: stripURLQuery(strings.TrimSpace(u.Link)),
+			}
+		}
+		out[i] = g
+	}
+	return out
 }
 
 func movieDetailInfoUpsert() clause.OnConflict {
@@ -389,29 +528,41 @@ func SaveDetails(id string, list []model.MovieDetail) error {
 	return err
 }
 
-func SaveDetailsForCollect(id string, list []model.MovieDetail) ([]int64, error) {
+// CollectWriteResult 采集写入结果。
+// AffectedMIDs：有业务写入的 mid（缓存/快照收尾）；NotifyMIDs：应进更新列表的 mid（剧集结构变更或新片）。
+type CollectWriteResult struct {
+	AffectedMIDs []int64
+	NotifyMIDs   []int64
+}
+
+// SaveDetailsForCollect 采集写主站详情。返回的 NotifyMIDs 仅含「剧集/播放源结构」真变更或新片，
+// 片名标点/备注/封面/链接签名等噪声写库时不进入更新列表。
+func SaveDetailsForCollect(id string, list []model.MovieDetail) (CollectWriteResult, error) {
 	return saveDetails(id, list, false)
 }
 
-func saveDetails(id string, list []model.MovieDetail, refreshSearchTags bool) ([]int64, error) {
+func saveDetails(id string, list []model.MovieDetail, refreshSearchTags bool) (CollectWriteResult, error) {
+	var out CollectWriteResult
 	infoList, _, err := buildFilmIndexesFromDetails(id, list)
 	if err != nil {
-		return nil, err
+		return out, err
 	}
 	infoList = filterValidFilmIndexes(infoList)
 	if len(infoList) == 0 {
-		return nil, nil
+		return out, nil
 	}
 
+	detailsByKey := detailMapByContentKey(list)
 	var changedInfos []model.FilmIndex
 	var infoByKey map[string]model.FilmIndex
 	var changedDetails []model.MovieDetail
-	affectedMIDs := make([]int64, 0, len(infoList))
+	var oldDetailsByMid map[int64]model.MovieDetail
 	if err := db.Mdb.Transaction(func(tx *gorm.DB) error {
-		unchangedKeys, err := applyMasterBusinessUpdateStampsTx(tx, infoList, detailMapByContentKey(list))
+		unchangedKeys, oldDetails, err := applyMasterBusinessUpdateStampsTx(tx, infoList, detailsByKey)
 		if err != nil {
 			return err
 		}
+		oldDetailsByMid = oldDetails
 		changedInfos, infoByKey, changedDetails = filterChangedMasterWrites(infoList, list, unchangedKeys)
 
 		if len(changedInfos) > 0 {
@@ -420,8 +571,9 @@ func saveDetails(id string, list []model.MovieDetail, refreshSearchTags bool) ([
 			}
 		}
 
-		keyToMid := loadFilmIndexMidMapByContentKeysTx(tx, buildContentKeys(infoList))
-		if keyToMid == nil {
+		// 主站 mid=源站 id：直接由本批构造，避免未懒升行 content_key 仍为 name_* 时反查 miss。
+		keyToMid := keyToMidFromIndexes(infoList)
+		if len(keyToMid) == 0 {
 			return fmt.Errorf("load film index mids failed")
 		}
 		if err := saveMovieSourceMappingsTxE(tx, buildMovieSourceMappings(infoList, keyToMid)); err != nil {
@@ -444,14 +596,17 @@ func saveDetails(id string, list []model.MovieDetail, refreshSearchTags bool) ([
 				changedInfos[i].Mid = mid
 			}
 		}
-		affectedMIDs = collectFilmIndexMIDs(changedInfos)
+		out.AffectedMIDs = collectFilmIndexMIDs(changedInfos)
 		return RefreshPlayFromSummaryByIndexesTx(tx, changedInfos)
 	}); err != nil {
-		return nil, err
+		return CollectWriteResult{}, err
 	}
 	if len(changedInfos) == 0 {
-		return affectedMIDs, nil
+		return out, nil
 	}
+
+	// 更新列表：仅剧集结构变更或新片；元数据噪声写库不进列表
+	out.NotifyMIDs = filterPlayStructureNotifyMIDs(changedInfos, detailsByKey, oldDetailsByMid)
 
 	// 仅在有实质变更时更新 last_collect_time / 失效缓存。
 	if refreshSearchTags {
@@ -464,7 +619,114 @@ func saveDetails(id string, list []model.MovieDetail, refreshSearchTags bool) ([
 		repository.NoteCollectSourceStats(id)
 		NoteCollectCacheInvalidationByIndexes(changedInfos)
 	}
-	return affectedMIDs, nil
+	return out, nil
+}
+
+// filterPlayStructureNotifyMIDs 从业务写入的影片中筛出应进「更新列表」的 mid：
+// 新片，或任一线路分集数量严格大于全库已有最大集数。
+// 数量未增加（如已有15集，后更新的源也是15集）不计入更新列表。
+func filterPlayStructureNotifyMIDs(changed []model.FilmIndex, detailsByKey map[string]model.MovieDetail, oldByMid map[int64]model.MovieDetail) []int64 {
+	if len(changed) == 0 {
+		return nil
+	}
+	mids := make([]int64, 0, len(changed))
+	for _, info := range changed {
+		if info.Mid > 0 {
+			mids = append(mids, info.Mid)
+		}
+	}
+	existingCountsMap, _ := loadExistingEpisodeCountsByMIDs(nil, mids, "")
+
+	out := make([]int64, 0, len(changed))
+	seen := make(map[int64]struct{}, len(changed))
+	for _, info := range changed {
+		mid := info.Mid
+		if mid <= 0 {
+			continue
+		}
+		if _, ok := seen[mid]; ok {
+			continue
+		}
+		newDetail, ok := detailsByKey[info.ContentKey]
+		if !ok {
+			continue
+		}
+
+		existingCounts := existingCountsMap[mid]
+		if oldDetail, hasOld := oldByMid[mid]; hasOld {
+			existingCounts = append(existingCounts, extractEpisodeCountsFromDetail(oldDetail)...)
+		}
+
+		newCounts := extractEpisodeCountsFromDetail(newDetail)
+		if isEpisodeCountHigher(newCounts, existingCounts) {
+			seen[mid] = struct{}{}
+			out = append(out, mid)
+		}
+	}
+	return out
+}
+
+// masterPlaylistSignatures 把主站详情转成与附属站一致的线路签名列表（线路名 + 集数内容），
+// 复用 playlistLastEpisodeChanged 做「最后一集变化」判定。
+func masterPlaylistSignatures(d model.MovieDetail) []playlistSignature {
+	n := len(d.PlayList)
+	sigs := make([]playlistSignature, 0, n)
+	for i := 0; i < n; i++ {
+		name := ""
+		if i < len(d.PlayFrom) {
+			name = strings.TrimSpace(d.PlayFrom[i])
+		}
+		data, _ := json.Marshal(d.PlayList[i])
+		sigs = append(sigs, playlistSignature{GroupIndex: i, GroupName: name, Content: string(data)})
+	}
+	return sigs
+}
+
+// masterLastEpisodeChanged 新详情相对旧详情，任一线路「最后一项分集标签」是否变化（含新增/回退）。
+func masterLastEpisodeChanged(oldDetail, newDetail model.MovieDetail) bool {
+	return playlistLastEpisodeChanged(masterPlaylistSignatures(oldDetail), masterPlaylistSignatures(newDetail))
+}
+
+// samePlayStructure 判断播放结构是否一致（线路 + 各线路最后一集标签）；忽略播放链接。
+func samePlayStructure(oldDetail, newDetail model.MovieDetail) bool {
+	return playStructureSignature(oldDetail) == playStructureSignature(newDetail)
+}
+
+func playStructureSignature(detail model.MovieDetail) string {
+	type row struct {
+		Index int    `json:"i"`
+		Name  string `json:"name"`
+		Last  string `json:"last"`
+	}
+	rows := make([]row, 0, len(detail.PlayList))
+	for i, links := range detail.PlayList {
+		name := ""
+		if i < len(detail.PlayFrom) {
+			name = strings.TrimSpace(detail.PlayFrom[i])
+		}
+		rows = append(rows, row{Index: i, Name: name, Last: lastEpisodeLabel(links)})
+	}
+	data, _ := json.Marshal(rows)
+	return string(data)
+}
+
+func normalizeEpisodeLabels(in [][]model.MovieUrlInfo) [][]string {
+	if len(in) == 0 {
+		return [][]string{}
+	}
+	out := make([][]string, len(in))
+	for i, group := range in {
+		if len(group) == 0 {
+			out[i] = []string{}
+			continue
+		}
+		labels := make([]string, len(group))
+		for j, u := range group {
+			labels[j] = strings.TrimSpace(u.Episode)
+		}
+		out[i] = labels
+	}
+	return out
 }
 
 func collectFilmIndexMIDs(infos []model.FilmIndex) []int64 {
@@ -486,7 +748,12 @@ func collectFilmIndexMIDs(infos []model.FilmIndex) []int64 {
 func detailMapByContentKey(details []model.MovieDetail) map[string]model.MovieDetail {
 	detailsByKey := make(map[string]model.MovieDetail, len(details))
 	for _, detail := range details {
-		detailsByKey[BuildContentKey(detail)] = detail
+		key := BuildContentKey(detail)
+		if key == "" {
+			// 无源站 id 且无法生成 name 指纹：不能作为主站身份，丢弃
+			continue
+		}
+		detailsByKey[key] = detail
 	}
 	return detailsByKey
 }
@@ -550,7 +817,7 @@ func SaveDetail(id string, detail model.MovieDetail) error {
 	var savedMid int64
 	if err := db.Mdb.Transaction(func(tx *gorm.DB) error {
 		infoList := []model.FilmIndex{snapshot}
-		unchangedKeys, err := applyMasterBusinessUpdateStampsTx(tx, infoList, detailMapByContentKey([]model.MovieDetail{detail}))
+		unchangedKeys, _, err := applyMasterBusinessUpdateStampsTx(tx, infoList, detailMapByContentKey([]model.MovieDetail{detail}))
 		if err != nil {
 			return err
 		}
@@ -563,8 +830,8 @@ func SaveDetail(id string, detail model.MovieDetail) error {
 			changed = true
 		}
 
-		keyToMid := loadFilmIndexMidMapByContentKeysTx(tx, buildContentKeys(infoList))
-		if keyToMid == nil {
+		keyToMid := keyToMidFromIndexes(infoList)
+		if len(keyToMid) == 0 {
 			return fmt.Errorf("load film index mids failed")
 		}
 		if err := saveMovieSourceMappingsTxE(tx, buildMovieSourceMappings(infoList, keyToMid)); err != nil {
@@ -621,6 +888,33 @@ func reloadFilmIndexesByContentKeysTx(tx *gorm.DB, contentKeys []string) []model
 	}
 	var infos []model.FilmIndex
 	if err := tx.Where("content_key IN ?", contentKeys).Find(&infos).Error; err != nil {
+		return nil
+	}
+	return infos
+}
+
+func filmIndexMIDs(infos []model.FilmIndex) []int64 {
+	mids := make([]int64, 0, len(infos))
+	seen := make(map[int64]struct{}, len(infos))
+	for _, info := range infos {
+		if info.Mid <= 0 {
+			continue
+		}
+		if _, ok := seen[info.Mid]; ok {
+			continue
+		}
+		seen[info.Mid] = struct{}{}
+		mids = append(mids, info.Mid)
+	}
+	return mids
+}
+
+func reloadFilmIndexesByMidsTx(tx *gorm.DB, mids []int64) []model.FilmIndex {
+	if len(mids) == 0 {
+		return nil
+	}
+	var infos []model.FilmIndex
+	if err := tx.Where("mid IN ?", mids).Find(&infos).Error; err != nil {
 		return nil
 	}
 	return infos
@@ -1219,7 +1513,11 @@ func normalizeSearchMetadata(detail model.MovieDetail, category resolvedSearchCa
 	}
 	updateStamp, err := utils.ParseCollectUpdateTime(detail.UpdateTime)
 	if err != nil {
-		return normalizedSearchMeta{}, fmt.Errorf("影片更新时间解析失败 name=%s id=%d updateTime=%q: %w", detail.Name, detail.Id, detail.UpdateTime, err)
+		// 解析失败不阻断入库；用当前时间兜底，避免整条元数据失败
+		// 可能影响按 update_stamp 排序的「最新」顺序，属可接受降级
+		log.Printf("[FilmWrite] 更新时间解析失败，使用当前时间兜底 name=%s id=%d updateTime=%q err=%v",
+			detail.Name, detail.Id, detail.UpdateTime, err)
+		updateStamp = time.Now().Unix()
 	}
 
 	finalArea := support.NormalizeArea(detail.Area)

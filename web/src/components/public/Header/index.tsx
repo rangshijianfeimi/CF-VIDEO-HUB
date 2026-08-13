@@ -102,12 +102,10 @@ export default function Header({ navList }: { navList: NavItem[] }) {
   }, []);
 
   // 布局 content loading 结束后，同步清掉 Header 导航中状态
-  useEffect(() => {
-    if (isNavigating && !contentLoadingActive) {
-      setIsNavigating(false);
-      setPendingCategoryId(null);
-    }
-  }, [isNavigating, contentLoadingActive]);
+  if (isNavigating && !contentLoadingActive) {
+    setIsNavigating(false);
+    setPendingCategoryId(null);
+  }
 
   const loadHistory = useCallback(() => {
     const historyMap = readHistoryMap();
@@ -145,12 +143,12 @@ export default function Header({ navList }: { navList: NavItem[] }) {
   const isCategoryActive = (id: string | number) => activeCategoryId === String(id);
 
   // 导航进行中保持乐观高亮，避免 URL 尚未更新时被 activePid 冲掉
-  useEffect(() => {
-    if (isNavigating) {
-      return;
+  if (!isNavigating) {
+    const nextActiveCategoryId = activePid ? String(activePid) : "";
+    if (nextActiveCategoryId !== activeCategoryId) {
+      setActiveCategoryId(nextActiveCategoryId);
     }
-    setActiveCategoryId(activePid ? String(activePid) : "");
-  }, [activePid, isNavigating]);
+  }
 
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
@@ -232,6 +230,33 @@ export default function Header({ navList }: { navList: NavItem[] }) {
     beginHeaderNavigation("home", "首页加载中...", "/");
   };
 
+  /** Logo 点击：优先跳转网站配置的 siteUrl，否则回前台首页 */
+  const navigateFromLogo = () => {
+    const siteUrl = String(siteInfo?.siteUrl || "").trim();
+    if (siteUrl) {
+      try {
+        const target = new URL(siteUrl, window.location.origin);
+        if (target.origin === window.location.origin) {
+          const path = `${target.pathname}${target.search}${target.hash}` || "/";
+          if (path === "/" || path === pathname) {
+            if (pathname === "/") return;
+            setActiveCategoryId("");
+            beginHeaderNavigation("home", "首页加载中...", "/");
+            return;
+          }
+          window.location.assign(target.href);
+          return;
+        }
+        window.open(target.href, "_blank", "noopener,noreferrer");
+        return;
+      } catch {
+        window.open(siteUrl, "_blank", "noopener,noreferrer");
+        return;
+      }
+    }
+    navigateToHome();
+  };
+
   const historyContent = (
     <div className={`${styles.historyPanel} ${showHistory ? styles.show : ""}`}>
       <div className={styles.historyHeader}>
@@ -287,7 +312,11 @@ export default function Header({ navList }: { navList: NavItem[] }) {
             </div>
             
             {siteInfo?.siteName && (
-              <div className={styles.siteName} onClick={navigateToHome}>
+              <div
+                className={styles.siteName}
+                onClick={navigateFromLogo}
+                title={siteInfo.siteUrl ? `打开 ${siteInfo.siteUrl}` : "回首页"}
+              >
                 <SiteLogo
                   src={siteInfo.logo}
                   className={styles.logoImg}

@@ -2,12 +2,15 @@ package service
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"time"
 
 	"server/internal/config"
 	"server/internal/infra/db"
+	"server/internal/infra/syslog"
 	"server/internal/model"
+	"server/internal/notify"
 	"server/internal/repository"
 	filmrepo "server/internal/repository/film"
 	"server/internal/spider"
@@ -64,7 +67,15 @@ func (s *CollectService) GetEnabledFilmSources() []model.FilmSource {
 	return repository.GetEnabledCollectSourceList()
 }
 
+// UpdateFilmSource 编辑采集源配置（单源），发生变更时发送 source_config_changed 通知。
 func (s *CollectService) UpdateFilmSource(source model.FilmSource) error {
+	return s.updateFilmSource(source, nil)
+}
+
+// updateFilmSource 编辑采集源配置核心逻辑。
+// collector 非 nil 时（批量操作）不直接发送通知，而是把各源变更追加到收集器，
+// 由调用方统一发送聚合通知，避免批量操作逐源轰炸。
+func (s *CollectService) updateFilmSource(source model.FilmSource, collector *[]notify.SourceConfigChangeItem) error {
 	old := repository.FindCollectSourceById(source.Id)
 	if old == nil {
 		return errors.New("采集站信息不存在")
@@ -109,7 +120,7 @@ func (s *CollectService) UpdateFilmSource(source model.FilmSource) error {
 	err := db.Mdb.Transaction(func(tx *gorm.DB) error {
 		if masterLookup {
 			if err := repository.DemoteExistingMasterTx(tx); err != nil {
-				log.Printf("[Collect] 自动降级旧主站失败: %v", err)
+				syslog.Errorf("[Collect] 自动降级旧主站失败: %v", err)
 				return errors.New("主站自动降级失败，请重试")
 			}
 		}
@@ -122,7 +133,7 @@ func (s *CollectService) UpdateFilmSource(source model.FilmSource) error {
 
 	if masterLookup || masterUriChanged || masterDowngrade {
 		if err := filmrepo.ClearMasterDataBySourceIDsFast(affectedSourceIDs...); err != nil {
-			log.Printf("[Collect] 主站切换数据清理失败: %v", err)
+			syslog.Errorf("[Collect] 主站切换数据清理失败: %v", err)
 			return errors.New("主站切换数据清理失败，请重试")
 		}
 	}
@@ -132,41 +143,124 @@ func (s *CollectService) UpdateFilmSource(source model.FilmSource) error {
 		spider.StopTask(source.Id)
 	}
 
-	if masterLookup || masterUriChanged || masterDowngrade {
-		if source.Grade == model.MasterCollect && source.State {
+	// 分类树只跟主站走（主站未启用也可同步）；无主站则不同步、不从附属站构建
+	if masterLookup || masterUriChanged {
+		if source.Grade == model.MasterCollect {
 			if syncErr := SpiderSvc.SyncMasterCategoryTree(); syncErr != nil {
 				return syncErr
 			}
 		}
 	}
-	if source.Grade == model.MasterCollect && source.State && old.State != source.State {
+	// 主站启用/停用变更：停用后仍可用该主站 URI 同步分类；降级后若无主站则 Sync 会失败（符合「无主站无分类树」）
+	if source.Grade == model.MasterCollect && old.State != source.State {
 		if syncErr := SpiderSvc.SyncMasterCategoryTree(); syncErr != nil {
 			return syncErr
 		}
 	}
 	clearProvideNetworkConfigCache()
+	if changes := sourceChangeLabels(*old, source); len(changes) > 0 {
+		notifySourceConfigChanged(source.Name, source.Id, changes, collector)
+	}
+	// masterLookup：旧主站被自动降级且主数据已清空，单独通知，避免切换静默
+	if masterLookup {
+		for _, m := range masters {
+			if m.Id == source.Id {
+				continue
+			}
+			notifySourceConfigChanged(m.Name, m.Id, []string{"原主站已降级为附属站，主站数据已清空"}, collector)
+		}
+	}
 	return nil
 }
 
+// notifySourceConfigChanged 单条源配置变更通知：批量收集器非空时累积到收集器，否则立即发送。
+func notifySourceConfigChanged(sourceName, sourceID string, changes []string, collector *[]notify.SourceConfigChangeItem) {
+	if collector != nil {
+		*collector = append(*collector, notify.SourceConfigChangeItem{
+			SourceName: sourceName,
+			SourceID:   sourceID,
+			Changes:    changes,
+		})
+		return
+	}
+	notify.PublishSourceConfigChanged(sourceName, sourceID, changes)
+}
+
+// sourceChangeLabels 对比 old→next 生成源配置变更描述；无差异时返回 nil。
+func sourceChangeLabels(old, next model.FilmSource) []string {
+	var changes []string
+	if old.State != next.State {
+		changes = append(changes, fmt.Sprintf("启用状态: %s → %s", sourceStateLabel(old.State), sourceStateLabel(next.State)))
+	}
+	if old.Grade != next.Grade {
+		changes = append(changes, fmt.Sprintf("站点类型: %s → %s", sourceGradeLabel(old.Grade), sourceGradeLabel(next.Grade)))
+	}
+	if old.Uri != next.Uri {
+		changes = append(changes, "接口地址已变更")
+	}
+	if old.Name != next.Name {
+		changes = append(changes, fmt.Sprintf("站点名称: %s → %s", old.Name, next.Name))
+	}
+	if old.Interval != next.Interval {
+		changes = append(changes, fmt.Sprintf("请求间隔: %dms → %dms", old.Interval, next.Interval))
+	}
+	if old.Cd != next.Cd {
+		changes = append(changes, fmt.Sprintf("采集时长: %d小时 → %d小时", old.Cd, next.Cd))
+	}
+	return changes
+}
+
+func sourceStateLabel(on bool) string {
+	if on {
+		return "已启用"
+	}
+	return "已停用"
+}
+
+func sourceGradeLabel(g model.SourceGrade) string {
+	if g == model.MasterCollect {
+		return "主站"
+	}
+	return "附属站"
+}
+
+
 func (s *CollectService) BatchUpdateFilmSourceState(ids []string, state bool) error {
+	var collector []notify.SourceConfigChangeItem
+	var firstErr error
 	for _, id := range ids {
 		source := repository.FindCollectSourceById(id)
 		if source == nil {
-			return errors.New("采集站信息不存在")
+			firstErr = errors.New("采集站信息不存在")
+			break
 		}
 		if source.State == state {
 			continue
 		}
 		next := *source
 		next.State = state
-		if err := s.UpdateFilmSource(next); err != nil {
-			return err
+		if err := s.updateFilmSource(next, &collector); err != nil {
+			firstErr = err
+			break
 		}
 	}
-	return nil
+	// 全成功或部分成功均发送已收集的变更，避免中途失败时静默丢失已生效的源
+	if len(collector) > 0 {
+		notify.PublishSourceConfigsChanged(collector)
+	}
+	return firstErr
 }
 
+// MaxCollectSources 采集站数量上限（与前端 MAX_COLLECT_SOURCES 一致）
+const MaxCollectSources = 12
+
 func (s *CollectService) SaveFilmSource(source model.FilmSource) error {
+	// 新增时校验总数上限（更新走 Update 不经过此路径）
+	existing := repository.GetCollectSourceList()
+	if len(existing) >= MaxCollectSources {
+		return fmt.Errorf("采集站数量已达上限（%d 个），请先删除不用的采集站", MaxCollectSources)
+	}
+
 	// 强制单主站机制：如果新增站点为主站，自动降级现有主站
 	if source.Grade == model.MasterCollect {
 		if source.Id == "" {
@@ -189,23 +283,32 @@ func (s *CollectService) SaveFilmSource(source model.FilmSource) error {
 			return err
 		}
 		if err := filmrepo.ClearMasterDataBySourceIDsFast(affectedSourceIDs...); err != nil {
-			log.Printf("[Collect] 新主站接管前数据清理失败: %v", err)
+			syslog.Errorf("[Collect] 新主站接管前数据清理失败: %v", err)
 			return errors.New("主站切换数据清理失败，请重试")
 		}
 		spider.ClearLimiter(source.Id)
-		if source.State {
-			if syncErr := SpiderSvc.SyncMasterCategoryTree(); syncErr != nil {
-				return syncErr
-			}
+		// 新增主站即同步分类树（未启用也要同步；分类树只认主站）
+		if syncErr := SpiderSvc.SyncMasterCategoryTree(); syncErr != nil {
+			return syncErr
 		}
 		clearProvideNetworkConfigCache()
+		notify.PublishSourceConfigChanged(source.Name, source.Id, []string{"新增采集源（主站）"})
+		// 现有主站被自动降级且主数据已清空，单独通知
+		for _, m := range masters {
+			notify.PublishSourceConfigChanged(m.Name, m.Id, []string{"原主站已降级为附属站，主站数据已清空"})
+		}
 		return nil
+	}
+	// 附属站新增：与主站分支一致，先基于 URI 生成稳定 ID，供通知限流 key 与消息展示使用。
+	if source.Id == "" {
+		source.Id = utils.GenerateHashKey(source.Uri)
 	}
 	if err := repository.AddCollectSource(source); err != nil {
 		return err
 	}
 	spider.ClearLimiter(source.Id)
 	clearProvideNetworkConfigCache()
+	notify.PublishSourceConfigChanged(source.Name, source.Id, []string{"新增采集源（附属站）"})
 	return nil
 }
 
@@ -222,6 +325,7 @@ func (s *CollectService) DelFilmSource(id string) error {
 	}
 	spider.ClearLimiter(id)
 	clearProvideNetworkConfigCache()
+	notify.PublishSourceConfigChanged(src.Name, src.Id, []string{"删除采集源"})
 	return nil
 }
 

@@ -2,6 +2,10 @@
 
 import React, { useState, useEffect } from "react";
 import { useRouter, usePathname } from "next/navigation";
+
+
+
+import Link from "next/link";
 import {
   Layout,
   Menu,
@@ -12,30 +16,41 @@ import {
   Tag,
   Drawer,
   Grid,
+  Alert,
 } from "antd";
 import {
   HomeOutlined,
   ThunderboltOutlined,
-  ClockCircleOutlined,
   VideoCameraOutlined,
   FolderOpenOutlined,
   MenuFoldOutlined,
   MenuUnfoldOutlined,
   LogoutOutlined,
   UserOutlined,
+  TeamOutlined,
+  SettingOutlined,
   BgColorsOutlined,
   SunOutlined,
   MoonOutlined,
   DesktopOutlined,
-  FileTextOutlined,
 } from "@ant-design/icons";
+
 import type { MenuProps } from "antd";
 import { ApiGet, ApiPost } from "@/lib/client-api";
 import { useSiteConfig } from "@/components/common/SiteGuard";
 import { useThemeMode } from "@/components/theme/GlobalThemeProvider";
 import type { ThemeMode } from "@/components/theme/ThemeDock";
 import { resolveSiteLogoSrc } from "@/components/public/SiteLogo";
+import { ManagePermissionProvider } from "@/lib/manage-permission";
 import styles from "./index.module.less";
+
+type AdminNotice = {
+  level?: string;
+  code?: string;
+  message: string;
+  actionPath?: string;
+  actionText?: string;
+};
 
 const { Sider, Header, Content } = Layout;
 const { useBreakpoint } = Grid;
@@ -55,48 +70,51 @@ const menuItems: MenuItem[] = [
     label: "工作台",
   },
   {
-    key: "sub-film",
-    icon: <VideoCameraOutlined />,
-    label: "内容管理",
-    children: [
-      { key: "/manage/film", label: "影片列表" },
-      { key: "/manage/collect/category", label: "分类管理" },
-      { key: "/manage/collect/category/rules", label: "分类规则" },
-    ],
-  },
-  {
     key: "sub-collect",
     icon: <ThunderboltOutlined />,
-    label: "采集中心",
+    label: "采集管理",
     children: [
-      { key: "/manage/collect", label: "采集站点" },
+      { key: "/manage/collect", label: "采集中心" },
       { key: "/manage/collect/record", label: "失败记录" },
       { key: "/manage/cron", label: "计划任务" },
     ],
   },
   {
-    key: "/manage/file",
-    icon: <FolderOpenOutlined />,
-    label: "图片素材",
-  },
-  {
-    key: "sub-system",
-    icon: <ClockCircleOutlined />,
-    label: "系统设置",
+    key: "sub-film",
+    icon: <VideoCameraOutlined />,
+    label: "内容管理",
     children: [
-      { key: "/manage/system/website", label: "网站配置" },
-      { key: "/manage/system/banners", label: "首页封面" },
-      { key: "/manage/system/users", label: "账号管理" },
+      { key: "/manage/film", label: "影片列表" },
+      { key: "/manage/banners", label: "首页轮播" },
+      { key: "/manage/collect/category", label: "分类管理" },
+      { key: "/manage/collect/category/rules", label: "分类规则" },
     ],
   },
   {
-    key: "/manage/system/logs",
-    icon: <FileTextOutlined />,
-    label: "系统日志",
+    key: "/manage/file",
+    icon: <FolderOpenOutlined />,
+    label: "素材中心",
+  },
+  {
+    key: "/manage/system/users",
+    icon: <TeamOutlined />,
+    label: "账号管理",
+  },
+  {
+    key: "/manage/system",
+    icon: <SettingOutlined />,
+    label: "系统设置",
   },
 ];
 
 function resolveMenuKey(pathname: string) {
+  // 旧数据重置入口并入系统设置 · 数据安全
+  if (pathname.startsWith("/manage/reset")) {
+    return "/manage/system";
+  }
+  if (pathname.startsWith("/manage/banners")) {
+    return "/manage/banners";
+  }
   if (pathname.startsWith("/manage/film/add")) {
     return "/manage/film";
   }
@@ -118,17 +136,11 @@ function resolveMenuKey(pathname: string) {
   if (pathname.startsWith("/manage/cron")) {
     return "/manage/cron";
   }
-  if (pathname.startsWith("/manage/system/website")) {
-    return "/manage/system/website";
-  }
-  if (pathname.startsWith("/manage/system/banners")) {
-    return "/manage/system/banners";
-  }
   if (pathname.startsWith("/manage/system/users")) {
     return "/manage/system/users";
   }
-  if (pathname.startsWith("/manage/system/logs")) {
-    return "/manage/system/logs";
+  if (pathname.startsWith("/manage/system")) {
+    return "/manage/system";
   }
   if (pathname.startsWith("/manage/file")) {
     return "/manage/file";
@@ -136,27 +148,21 @@ function resolveMenuKey(pathname: string) {
   return "/manage";
 }
 
-function collectOpenKeys(items: MenuItem[], selectedKey: string) {
+
+function collectAllOpenKeys(items: MenuItem[]) {
   const openKeys: string[] = [];
   for (const item of items) {
     if (
       !item ||
       typeof item !== "object" ||
       !("children" in item) ||
-      !item.children
+      !item.children ||
+      !("key" in item) ||
+      typeof item.key !== "string"
     ) {
       continue;
     }
-    const hasMatch = item.children.some(
-      (child) =>
-        child &&
-        typeof child === "object" &&
-        "key" in child &&
-        child.key === selectedKey,
-    );
-    if (hasMatch && "key" in item && typeof item.key === "string") {
-      openKeys.push(item.key);
-    }
+    openKeys.push(item.key);
   }
   return openKeys;
 }
@@ -171,13 +177,19 @@ export default function ManageLayoutView({
   const { config: siteInfo } = useSiteConfig();
   const { mode, setMode } = useThemeMode();
   const [userInfo, setUserInfo] = useState<any>(null);
+  const [notices, setNotices] = useState<AdminNotice[]>([]);
   const screens = useBreakpoint();
   const isMobile = !screens.lg;
 
   const router = useRouter();
   const pathname = usePathname();
+  const isSystemPage = pathname.startsWith("/manage/system");
   const selectedKey = resolveMenuKey(pathname);
-  const isLogPage = pathname.startsWith("/manage/system/logs");
+
+
+
+
+
 
   useEffect(() => {
     ApiGet("/manage/user/info").then((resp) => {
@@ -186,6 +198,15 @@ export default function ManageLayoutView({
       }
     });
   }, []);
+
+  // 进入后台及路由切换时刷新公告（数据重置后应消失）
+  useEffect(() => {
+    ApiGet("/manage/index").then((resp) => {
+      if (resp.code === 0 && Array.isArray(resp.data?.notices)) {
+        setNotices(resp.data.notices as AdminNotice[]);
+      }
+    });
+  }, [pathname]);
 
   const onMenuClick: MenuProps["onClick"] = ({ key }) => {
     if (isMobile) {
@@ -203,7 +224,7 @@ export default function ManageLayoutView({
     }
   };
 
-  const openKeys = collectOpenKeys(menuItems, selectedKey);
+  const openKeys = collectAllOpenKeys(menuItems);
   const themeMenuItems: MenuProps["items"] = [
     {
       key: "light",
@@ -224,7 +245,14 @@ export default function ManageLayoutView({
 
   const menuNode = (
     <>
-      <div className={styles.logoWrap} onClick={() => window.open("/", "_blank")}>
+      <div
+        className={styles.logoWrap}
+        onClick={() => {
+          const url = String(siteInfo?.siteUrl || "").trim() || "/";
+          window.open(url, "_blank", "noopener,noreferrer");
+        }}
+        title={siteInfo?.siteUrl ? `打开 ${siteInfo.siteUrl}` : "打开前台首页"}
+      >
         <Avatar
           src={resolveSiteLogoSrc(siteInfo?.logo)}
           size={34}
@@ -341,20 +369,51 @@ export default function ManageLayoutView({
           </Space>
         </Header>
         <Content
-          className={`${styles.content} ${isLogPage ? styles.contentFixed : ""}`}
-          style={{ flex: 1, overflow: isLogPage ? "hidden" : "auto" }}
+          className={`${styles.content} ${isSystemPage ? styles.contentFixed : ""}`}
+          style={{ flex: 1, overflow: isSystemPage ? "hidden" : "auto" }}
         >
-          {children}
+
+          {notices.length > 0 && (
+            <div className={styles.noticeStack}>
+              {notices.map((n) => (
+                <Alert
+                  key={n.code || n.message}
+                  type={
+                    n.level === "warning"
+                      ? "warning"
+                      : n.level === "info"
+                        ? "info"
+                        : "error"
+                  }
+                  showIcon
+                  title={n.message}
+                  action={
+                    n.actionPath ? (
+                      <Link href={n.actionPath}>
+                        <Button size="small" type="primary" danger={n.level !== "info" && n.level !== "warning"}>
+                          {n.actionText || "查看"}
+                        </Button>
+                      </Link>
+                    ) : undefined
+                  }
+                  className={styles.noticeAlert}
+                />
+              ))}
+            </div>
+          )}
+          <ManagePermissionProvider canWrite={userInfo?.canWrite !== false}>
+            {children}
+          </ManagePermissionProvider>
         </Content>
       </Layout>
       <Drawer
         title="后台菜单"
         placement="left"
-        width={280}
+        size={280}
         open={isMobile && drawerOpen}
         onClose={() => setDrawerOpen(false)}
         className={styles.menuDrawer}
-        bodyStyle={{ padding: 0 }}
+        styles={{ body: { padding: 0 } }}
       >
         <div className={styles.drawerInner}>{menuNode}</div>
       </Drawer>

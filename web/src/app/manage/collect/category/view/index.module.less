@@ -4,6 +4,21 @@
   gap: 16px;
 }
 
+.panelCard {
+  border: 1px solid var(--ant-color-border-secondary);
+  border-radius: 12px;
+  background: var(--ant-color-bg-container);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+
+  :global(.ant-card-body) {
+    padding: 16px;
+  }
+}
+
+html[data-theme="dark"] .panelCard {
+  border-color: rgba(255, 255, 255, 0.16);
+}
+
 .workspace {
   display: flex;
   flex-direction: column;
@@ -14,6 +29,7 @@
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+  align-items: center;
 }
 
 .ruleWorkspace {
@@ -25,28 +41,30 @@
 
 .tableHeader {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 12px;
   flex-wrap: wrap;
 }
 
 .tableTitle {
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 600;
   line-height: 32px;
+  color: var(--ant-color-text);
 }
 
 .tableActions {
   display: flex;
   flex-wrap: wrap;
+  gap: 8px;
 }
 
 .pagination {
   display: flex;
   justify-content: flex-end;
   flex-wrap: wrap;
-  gap: 12px;
+  gap: 8px;
 }
 
 .groupSelect {
@@ -68,6 +86,34 @@
 
 .fullWidth {
   width: 100%;
+}
+
+.level1Row {
+  background-color: rgba(250, 140, 22, 0.04) !important;
+
+  td {
+    font-weight: 500;
+  }
+}
+
+:global(html[data-theme="dark"]) .level1Row {
+  background-color: rgba(255, 255, 255, 0.04) !important;
+}
+
+.level2Row {
+  background-color: var(--ant-color-bg-container);
+}
+
+.expandableRow {
+  cursor: pointer;
+
+  &:hover td {
+    background-color: rgba(250, 140, 22, 0.08) !important;
+  }
+}
+
+:global(html[data-theme="dark"]) .expandableRow:hover td {
+  background-color: rgba(255, 255, 255, 0.08) !important;
 }
 
 .dragHandle {

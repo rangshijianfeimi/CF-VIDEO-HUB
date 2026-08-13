@@ -2,8 +2,11 @@ package handler
 
 import (
 	"fmt"
+	"strings"
+	"sync/atomic"
 
 	"server/internal/config"
+	"server/internal/infra/syslog"
 	"server/internal/model"
 	"server/internal/model/dto"
 	"server/internal/service"
@@ -15,6 +18,26 @@ import (
 type SpiderHandler struct{}
 
 var SpiderHd = new(SpiderHandler)
+
+// StopTask 停止单个采集任务（仅停止任务，不禁用采集站）。
+func (h *SpiderHandler) StopTask(c *gin.Context) {
+	var req struct {
+		Id string `json:"id"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		dto.Failed("请求参数异常", c)
+		return
+	}
+	if strings.TrimSpace(req.Id) == "" {
+		dto.Failed("参数异常，采集站标识不能为空", c)
+		return
+	}
+	if err := service.SpiderSvc.StopTask(req.Id); err != nil {
+		dto.Failed(err.Error(), c)
+		return
+	}
+	dto.SuccessOnlyMsg("已发送停止指令，采集任务正在停止", c)
+}
 
 // StarSpider 开启并执行采集任务
 func (h *SpiderHandler) StarSpider(c *gin.Context) {
@@ -50,7 +73,10 @@ func (h *SpiderHandler) StarSpider(c *gin.Context) {
 	dto.SuccessOnlyMsg("采集任务已成功开启!!!", c)
 }
 
-// ClearAllFilm 删除所有film信息
+// resetSiteDataRunning 防止并发重复触发站点数据重置（重置为长耗时异步任务）
+var resetSiteDataRunning atomic.Bool
+
+// ClearAllFilm 删除所有film信息：密钥校验通过后立即返回成功，重置在后台异步执行。
 func (h *SpiderHandler) ClearAllFilm(c *gin.Context) {
 	var req struct {
 		Password string `json:"password"`
@@ -59,16 +85,33 @@ func (h *SpiderHandler) ClearAllFilm(c *gin.Context) {
 		dto.Failed("请求参数异常!!!", c)
 		return
 	}
-	pwd := req.Password
-	if !verifyPassword(c, pwd) {
+	if !verifyPassword(c, req.Password) {
 		dto.Failed("重置失败, 密钥校验失败!!!", c)
 		return
 	}
-	if err := service.SpiderSvc.ClearFilms(); err != nil {
-		dto.Failed(fmt.Sprint("影视数据重置失败: ", err.Error()), c)
+	if !resetSiteDataRunning.CompareAndSwap(false, true) {
+		dto.Failed("站点数据正在重置中，请勿重复操作", c)
 		return
 	}
-	dto.SuccessOnlyMsg("全站数据已恢复默认值，默认采集源、定时任务、配置、轮播和分类已重建!!!", c)
+	go func() {
+		defer resetSiteDataRunning.Store(false)
+		if err := service.SpiderSvc.ClearFilms(); err != nil {
+			syslog.Errorf("[数据重置] 重置失败: %v", err)
+			return
+		}
+		syslog.Infof("[数据重置] 重置完成")
+	}()
+	dto.SuccessOnlyMsg("数据重置已开始，正在清空影视与采集数据", c)
+}
+
+// ResetProgress 返回数据重置实时进度（供前端轮询）
+func (h *SpiderHandler) ResetProgress(c *gin.Context) {
+	dto.Success(service.SpiderSvc.ResetProgress(), "获取成功", c)
+}
+
+// ResetImpactStats 返回数据重置影响面统计（将清空的数据量）
+func (h *SpiderHandler) ResetImpactStats(c *gin.Context) {
+	dto.Success(service.SpiderSvc.ResetImpactStats(), "获取成功", c)
 }
 
 // SingleUpdateSpider 单一影片主站更新采集

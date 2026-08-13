@@ -2,21 +2,27 @@
   display: flex;
   flex-direction: column;
   gap: 16px;
+  min-width: 0;
 }
 
-.logoPreview {
-  border-radius: 10px;
+.card {
+  border-radius: 12px;
+  box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.04), 0 1px 2px 0 rgba(0, 0, 0, 0.02);
 }
 
-.switchEditor {
-  min-height: 48px;
+/* 约束配置值区域，避免 Tag/文本被横向撑满 */
+.configMeta {
+  width: 100%;
+  min-width: 0;
 }
 
-.dangerCard {
-  border-color: var(--ant-color-error-border);
-  background: var(--ant-color-error-bg);
+.configValue {
+  display: inline-flex;
+  max-width: 100%;
+  min-width: 0;
 }
 
-.dangerText {
-  max-width: 720px;
+.configHint {
+  font-size: 12px;
+  line-height: 20px;
 }

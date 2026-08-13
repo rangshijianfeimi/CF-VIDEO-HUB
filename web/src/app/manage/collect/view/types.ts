@@ -2,7 +2,6 @@ export interface FilmSource {
   id: string;
   name: string;
   uri: string;
-  syncPictures: boolean;
   state: boolean;
   grade: number;
   interval: number;
@@ -73,13 +72,42 @@ export interface BatchOption {
   state?: boolean;
 }
 
+/** 失效源检测结果项 */
+export interface InvalidSourceItem {
+  id: string;
+  name: string;
+  uri: string;
+  grade: number;
+  state: boolean;
+  reason: string;
+}
+
+/** 检测或删除时被跳过的采集站 */
+export interface CleanupSkippedItem {
+  id: string;
+  name?: string;
+  reason: string;
+}
+
+export interface CheckAllResult {
+  checked: number;
+  ok: number;
+  failed: InvalidSourceItem[];
+  skipped: CleanupSkippedItem[];
+}
+
+export interface DelBatchResult {
+  deleted: string[];
+  skipped: CleanupSkippedItem[];
+}
+
 export interface SourceFormValues {
   name: string;
   uri: string;
-  syncPictures: boolean;
   state: boolean;
   grade: number;
   interval: number;
+  cd: number;
 }
 
 export const collectDuration = [
@@ -92,3 +120,39 @@ export const collectDuration = [
   { label: "采集半年", time: 4320 },
   { label: "全量采集", time: -1 },
 ];
+
+/** 采集站数量上限（前后端一致） */
+export const MAX_COLLECT_SOURCES = 12;
+
+/**
+ * 单站进度百分比。
+ * 活跃态与 CollectProgressView 一致；终态（done/failed/stopped）计 100%，便于批量总进度收口。
+ */
+export function stationProgressPercent(progress?: CollectProgress | null): number {
+  if (!progress) {
+    return 0;
+  }
+  if (
+    progress.status === "done" ||
+    progress.status === "failed" ||
+    progress.status === "stopped"
+  ) {
+    return 100;
+  }
+  const total = Math.max(progress.total, 0);
+  const finished = Math.max(progress.success + progress.failed, 0);
+  const done = Math.min(finished, total || finished);
+  const rawPercent = total > 0 ? Math.floor((done / total) * 100) : 0;
+  const inPostPagePhase =
+    progress.status === "page_done" ||
+    progress.status === "waiting_publish" ||
+    progress.status === "finalizing";
+  const zeroPageFinished = total === 0 && inPostPagePhase;
+  if (inPostPagePhase || zeroPageFinished) {
+    return 99;
+  }
+  if (progress.status === "starting") {
+    return 0;
+  }
+  return Math.min(rawPercent, 99);
+}

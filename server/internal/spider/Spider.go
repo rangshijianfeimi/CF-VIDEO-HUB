@@ -18,10 +18,12 @@ import (
 	"github.com/go-sql-driver/mysql"
 
 	"server/internal/config"
+	"server/internal/infra/db"
+	"server/internal/infra/syslog"
 	"server/internal/model"
+	"server/internal/notify"
 	"server/internal/repository"
 	filmrepo "server/internal/repository/film"
-	"server/internal/spider/conver"
 	"server/internal/utils"
 )
 
@@ -63,8 +65,6 @@ var stopAllVersion atomic.Uint64
 var sourceWriteLocks sync.Map
 
 var collectProgress sync.Map
-
-var pictureSyncRunning atomic.Bool
 
 var asyncMasterSearchTagsMu sync.Mutex
 
@@ -188,14 +188,14 @@ func collectProgressSnapshot(sourceID string) (model.CollectProgress, bool) {
 // page_done: 分页拉取+写库已结束（单站即将收尾）
 // waiting_publish: 批量场景下本站已采完，等待整批统一发布
 const (
-	progressStatusStarting        = "starting"
-	progressStatusRunning         = "running"
-	progressStatusPageDone        = "page_done"
-	progressStatusWaitingPublish  = "waiting_publish"
-	progressStatusFinalizing      = "finalizing"
-	progressStatusDone            = "done"
-	progressStatusFailed          = "failed"
-	progressStatusStopped         = "stopped"
+	progressStatusStarting       = "starting"
+	progressStatusRunning        = "running"
+	progressStatusPageDone       = "page_done"
+	progressStatusWaitingPublish = "waiting_publish"
+	progressStatusFinalizing     = "finalizing"
+	progressStatusDone           = "done"
+	progressStatusFailed         = "failed"
+	progressStatusStopped        = "stopped"
 )
 
 func isActiveCollectStatus(status string) bool {
@@ -206,6 +206,116 @@ func isActiveCollectStatus(status string) bool {
 	default:
 		return false
 	}
+}
+
+func isTerminalCollectStatus(status string) bool {
+	switch status {
+	case progressStatusDone, progressStatusFailed, progressStatusStopped:
+		return true
+	default:
+		return false
+	}
+}
+
+// isPostFetchCollectStatus 分页已结束、等待整批收尾/发布的阶段。
+// 这些状态可能因其它站仍在采而挂很久，禁止按单站 30m 未更新标 failed。
+func isPostFetchCollectStatus(status string) bool {
+	switch status {
+	case progressStatusPageDone, progressStatusWaitingPublish, progressStatusFinalizing:
+		return true
+	default:
+		return false
+	}
+}
+
+// shouldMarkProgressStale 仅对「无 live task 的 starting/running」做超时 failed。
+// waiting_publish / finalizing / page_done 属正常等待整批收尾，不超时。
+func shouldMarkProgressStale(status string, live bool, age, staleAfter time.Duration) bool {
+	if age < staleAfter {
+		return false
+	}
+	if isPostFetchCollectStatus(status) {
+		return false
+	}
+	if live && (status == progressStatusRunning || status == progressStatusStarting) {
+		return false
+	}
+	return status == progressStatusStarting || status == progressStatusRunning
+}
+
+// hasAnyLiveOrActiveCollect 是否仍有未完成的采集（含 live task 与活跃进度）。
+// 有则保留全部终态进度，避免部分卡片进度条先消失。
+func hasAnyLiveOrActiveCollect() bool {
+	has := false
+	activeTasks.Range(func(key, value any) bool {
+		has = true
+		return false
+	})
+	if has {
+		return true
+	}
+	collectProgress.Range(func(key, value any) bool {
+		state := value.(*collectProgressState)
+		state.mu.RLock()
+		active := isActiveCollectStatus(state.data.Status)
+		state.mu.RUnlock()
+		if active {
+			has = true
+			return false
+		}
+		return true
+	})
+	return has
+}
+
+// latestTerminalProgressTime 最晚进入终态的时间；无终态时 ok=false。
+func latestTerminalProgressTime() (latest time.Time, ok bool) {
+	collectProgress.Range(func(key, value any) bool {
+		state := value.(*collectProgressState)
+		state.mu.RLock()
+		status := state.data.Status
+		updated := state.updated
+		state.mu.RUnlock()
+		if !isTerminalCollectStatus(status) {
+			return true
+		}
+		if !ok || updated.After(latest) {
+			latest = updated
+			ok = true
+		}
+		return true
+	})
+	return latest, ok
+}
+
+// purgeAllTerminalProgress 删除全部 done/failed/stopped 进度（统一消失）。
+func purgeAllTerminalProgress() {
+	collectProgress.Range(func(key, value any) bool {
+		id, _ := key.(string)
+		state := value.(*collectProgressState)
+		state.mu.RLock()
+		terminal := isTerminalCollectStatus(state.data.Status)
+		state.mu.RUnlock()
+		if terminal {
+			collectProgress.Delete(id)
+		}
+		return true
+	})
+}
+
+// maybePurgeTerminalProgressTogether 全部采集结束后，以最晚终态时间为基准保留 retain，再一次性清空。
+func maybePurgeTerminalProgressTogether(now time.Time) {
+	if hasAnyLiveOrActiveCollect() {
+		return
+	}
+	latest, ok := latestTerminalProgressTime()
+	if !ok {
+		return
+	}
+	if now.Sub(latest) < progressRetainDuration() {
+		return
+	}
+	purgeAllTerminalProgress()
 }
 
 func canEnterFinalizing(status string) bool {
@@ -271,33 +381,41 @@ func refreshAndIsBlockingSourceProgress(sourceID string) bool {
 	staleAfter := progressStaleDuration()
 
 	state.mu.Lock()
-	defer state.mu.Unlock()
 	if !isActiveCollectStatus(state.data.Status) {
+		state.mu.Unlock()
 		return false
 	}
 	_, live := activeTasks.Load(sourceID)
-	if live && (state.data.Status == progressStatusRunning || state.data.Status == progressStatusStarting) {
+	age := now.Sub(state.updated)
+	// 收尾等待：仍阻挡重采，但不超时 failed。
+	if isPostFetchCollectStatus(state.data.Status) {
+		state.mu.Unlock()
 		return true
 	}
-	// waiting_publish / finalizing / 无 live task 的 starting|running：看是否超时。
-	age := now.Sub(state.updated)
-	if age >= staleAfter {
+	if live && (state.data.Status == progressStatusRunning || state.data.Status == progressStatusStarting) {
+		state.mu.Unlock()
+		return true
+	}
+	// 无 live task 的 starting/running 超时 → failed，允许重采。
+	if shouldMarkProgressStale(state.data.Status, live, age, staleAfter) {
 		old := state.data.Status
+		name := state.data.Name
 		state.data.Status = progressStatusFailed
 		state.updated = now
+		state.mu.Unlock()
 		log.Printf("[Spider] 进度超时清理 source=%s status=%s age=%s -> failed",
 			sourceID, old, age.Round(time.Second))
-		// 刚标 failed，不再阻挡重采。
+		emitProgressStaleNotify(sourceID, name, old, age)
 		return false
 	}
+	state.mu.Unlock()
 	return true
 }
 
-// pruneStaleCollectProgress 后台巡检：超时活跃 → failed；过期 done/failed/stopped → 删除。
+// pruneStaleCollectProgress 后台巡检：超时活跃 → failed；全部结束后终态进度统一删除。
 func pruneStaleCollectProgress() {
 	now := time.Now()
 	staleAfter := progressStaleDuration()
-	retainFor := progressRetainDuration()
 	collectProgress.Range(func(key, value any) bool {
 		id, _ := key.(string)
 		state := value.(*collectProgressState)
@@ -305,27 +423,23 @@ func pruneStaleCollectProgress() {
 		status := state.data.Status
 		updated := state.updated
 		age := now.Sub(updated)
-		switch {
-		case isActiveCollectStatus(status):
-			if _, live := activeTasks.Load(id); live && (status == progressStatusRunning || status == progressStatusStarting) {
-				state.mu.Unlock()
-				return true
-			}
-			if age >= staleAfter {
+		if isActiveCollectStatus(status) {
+			_, live := activeTasks.Load(id)
+			if shouldMarkProgressStale(status, live, age, staleAfter) {
+				name := state.data.Name
 				state.data.Status = progressStatusFailed
 				state.updated = now
-				log.Printf("[Spider] 进度超时清理 source=%s status=%s age=%s -> failed", id, status, age.Round(time.Second))
-			}
-		case status == progressStatusDone || status == progressStatusFailed || status == progressStatusStopped:
-			if age >= retainFor {
 				state.mu.Unlock()
-				collectProgress.Delete(id)
+				log.Printf("[Spider] 进度超时清理 source=%s status=%s age=%s -> failed", id, status, age.Round(time.Second))
+				emitProgressStaleNotify(id, name, status, age)
 				return true
 			}
 		}
 		state.mu.Unlock()
 		return true
 	})
+	// 终态不按单卡超时删除：有活跃采集时全部保留；全部完成后再统一消失。
+	maybePurgeTerminalProgressTogether(now)
 }
 
 var progressHousekeepingOnce sync.Once
@@ -751,8 +865,9 @@ func (s *collectLifecycleState) finishSourceAndFlush(source model.FilmSource) er
 	finalMIDs, finalMasterMIDs, err := flushPendingSources(pending, affectedMIDs, masterMIDs)
 	if err != nil {
 		s.restorePendingFlush(pending, finalMIDs, finalMasterMIDs)
+		return err
 	}
-	return err
+	return nil
 }
 
 func (s *collectLifecycleState) runFlush(flush func([]int64, []int64) error) error {
@@ -764,7 +879,8 @@ func (s *collectLifecycleState) runFlush(flush func([]int64, []int64) error) err
 
 	var err error
 	if pending != nil {
-		var finalMIDs, finalMasterMIDs []int64
+		var finalMIDs []int64
+		var finalMasterMIDs []int64
 		finalMIDs, finalMasterMIDs, err = flushPendingSources(pending, affectedMIDs, masterMIDs)
 		if err != nil {
 			s.restorePendingFlush(pending, finalMIDs, finalMasterMIDs)
@@ -903,7 +1019,7 @@ func scheduleMasterSearchTagsRefresh(masterMIDs []int64) {
 		start := time.Now()
 		log.Printf("[Spider][Finalizer] 主站搜索标签异步刷新开始 mid_count=%d", len(mids))
 		if err := filmrepo.RefreshSearchTagsByMids(mids...); err != nil {
-			log.Printf("[Spider][Finalizer] 主站搜索标签异步刷新失败 mid_count=%d err=%v", len(mids), err)
+			syslog.Errorf("[Spider][Finalizer] 主站搜索标签异步刷新失败 mid_count=%d err=%v", len(mids), err)
 			return
 		}
 		filmrepo.ClearAllSearchTagsCache()
@@ -961,28 +1077,41 @@ func normalizeAffectedMIDs(mids []int64) []int64 {
 	return res
 }
 
-func flushSourcesPending(tag string, sources []model.FilmSource) {
+func flushSourcesPending(tag, trigger string, sources []model.FilmSource, startedAt time.Time, batch *notify.ChangeBatch) {
 	if len(sources) == 0 {
 		return
 	}
+	if startedAt.IsZero() {
+		startedAt = time.Now()
+	}
 
 	flushMap := make(map[string]model.FilmSource, len(sources))
+	ordered := make([]model.FilmSource, 0, len(sources))
 	for _, source := range sources {
 		source.Id = strings.TrimSpace(source.Id)
 		if source.Id == "" {
 			continue
 		}
+		if _, ok := flushMap[source.Id]; ok {
+			continue
+		}
 		flushMap[source.Id] = source
+		ordered = append(ordered, source)
 	}
 	if len(flushMap) == 0 {
 		return
 	}
 
+	var finalizeErr error
 	if err := collectLifecycle.runFlush(func(affectedMIDs []int64, masterMIDs []int64) error {
 		_, _, err := flushPendingSources(flushMap, affectedMIDs, masterMIDs)
 		return err
 	}); err != nil {
-		log.Printf("[%s] 收尾刷新失败: %v", tag, err)
+		syslog.Errorf("[%s] 收尾刷新失败: %v", tag, err)
+		finalizeErr = err
+	}
+	if trigger != "" {
+		emitBatchSummaryForSources(batch, trigger, ordered, startedAt, finalizeErr)
 	}
 }
 
@@ -1166,15 +1295,61 @@ func waitRetryBackoff(ctx context.Context, attempt int) error {
 	}
 }
 
-func getSourcePageConcurrency(s *model.FilmSource) int {
-	limit := config.MAXGoroutine
-	if limit <= 0 {
-		limit = 1
-	}
-	return limit
+func countLiveCollectTasks() int {
+	n := 0
+	activeTasks.Range(func(key, value any) bool {
+		n++
+		return true
+	})
+	return n
 }
 
-func runSourcesWithLimit(sources []model.FilmSource, h int, tag string) {
+// getSourcePageConcurrency 单站分页 HTTP 并发；仅 1 站在跑时用 Solo 档吃满写阀。
+func getSourcePageConcurrency(_ *model.FilmSource) int {
+	base := config.CollectPageWorkers
+	if base <= 0 {
+		base = config.DefaultCollectPageWorkers
+	}
+	solo := config.CollectPageWorkersSolo
+	if solo <= 0 {
+		solo = config.DefaultCollectPageWorkersSolo
+	}
+	if solo < base {
+		solo = base
+	}
+	// live<=1：单站全量/仅剩一站时提高页并发
+	if countLiveCollectTasks() <= 1 {
+		if solo <= 0 {
+			return 1
+		}
+		return solo
+	}
+	if base <= 0 {
+		return 1
+	}
+	return base
+}
+
+// prioritizeCollectSources 主采集站优先派发，便于有限站并发时先跑主站。
+func prioritizeCollectSources(sources []model.FilmSource) []model.FilmSource {
+	if len(sources) <= 1 {
+		return sources
+	}
+	out := make([]model.FilmSource, 0, len(sources))
+	for _, s := range sources {
+		if s.Grade == model.MasterCollect {
+			out = append(out, s)
+		}
+	}
+	for _, s := range sources {
+		if s.Grade != model.MasterCollect {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func runSourcesWithLimit(sources []model.FilmSource, h int, tag, trigger string) {
 	if len(sources) == 0 {
 		return
 	}
@@ -1183,19 +1358,67 @@ func runSourcesWithLimit(sources []model.FilmSource, h int, tag string) {
 		return
 	}
 	markSourcesCollectStarting(sources)
-	runVersion := stopAllVersion.Load()
-	log.Printf("[%s] 主站/附属站并发采集，站点数=%d，站点并发不限制", tag, len(sources))
-	runSourcesGroupWithLimit(sources, h, tag, 0, runVersion)
-	if err := collectLifecycle.flushPending(); err != nil {
-		log.Printf("[%s] 批量采集收尾刷新失败: %v", tag, err)
+	runSourcesWithLimitCore(sources, h, tag, trigger)
+}
+
+// runSourcesWithLimitCore 假定 sources 已过滤且已 mark starting（或由调用方保证）。
+func runSourcesWithLimitCore(sources []model.FilmSource, h int, tag, trigger string) {
+	if len(sources) == 0 {
+		return
 	}
+
+	// 闭环保底：本地分类树为空时，仅从主站同步（含未启用主站）。
+	// 没有主站就不能有分类树——不从附属站拉分类。
+	if db.Mdb != nil {
+		var categoryCount int64
+		_ = db.Mdb.Model(&model.Category{}).Count(&categoryCount).Error
+		if categoryCount == 0 {
+			syslog.Warnf("[Spider] 检测到本地分类树为空(0 个分类)，尝试从主站同步分类树...")
+			target := repository.PickMasterSourceForCategory()
+			if target == nil {
+				syslog.Warnf("[Spider] 无主采集站，跳过分类树同步（没有主站就不能有分类树）")
+			} else if err := CollectCategory(target); err != nil {
+				syslog.Errorf("[Spider] 采集前自动同步主站分类失败 name=%s state=%v: %v",
+					target.Name, target.State, err)
+			} else {
+				repository.RefreshCategoryCache()
+				syslog.Infof("[Spider] 采集前自动同步主站分类成功 name=%s state=%v",
+					target.Name, target.State)
+			}
+		}
+	}
+
+	sources = prioritizeCollectSources(sources)
+	// 变更 mid 写入 MySQL 批次（无内存全量、无 Redis 会话），批次显式沿采集链传递
+	batch := notify.StartChangeBatch()
+	startedAt := time.Now()
+	runVersion := stopAllVersion.Load()
+	// 2C2G 默认限制同时跑的站点数，避免 N 站 × 页 worker 把内存/写阀打爆。
+	sourceLimit := config.CollectSourceConcurrency
+	if sourceLimit < 0 {
+		sourceLimit = 0
+	}
+	limitDesc := "不限制"
+	if sourceLimit > 0 {
+		limitDesc = fmt.Sprintf("%d", sourceLimit)
+	}
+	log.Printf("[%s] 采集派发 站点数=%d 站点并发=%s 页并发=%d 写阀 inflight=%d pages/s=%d",
+		tag, len(sources), limitDesc, config.CollectPageWorkers,
+		config.CollectWriteMaxInflight, config.CollectWritePagesPerSec)
+	runSourcesGroupWithLimit(sources, h, tag, sourceLimit, runVersion, batch)
+	var finalizeErr error
+	if err := collectLifecycle.flushPending(); err != nil {
+		syslog.Errorf("[%s] 批量采集收尾刷新失败: %v", tag, err)
+		finalizeErr = err
+	}
+	emitBatchSummaryForSources(batch, trigger, sources, startedAt, finalizeErr)
 }
 
 func isDispatchStopped(runVersion uint64) bool {
 	return stopAllVersion.Load() != runVersion
 }
 
-func runSourcesGroupWithLimit(sources []model.FilmSource, h int, tag string, limit int, runVersion uint64) {
+func runSourcesGroupWithLimit(sources []model.FilmSource, h int, tag string, limit int, runVersion uint64, batch *notify.ChangeBatch) {
 	if len(sources) == 0 {
 		return
 	}
@@ -1238,8 +1461,8 @@ func runSourcesGroupWithLimit(sources []model.FilmSource, h int, tag string, lim
 				log.Printf("[%s] 站点 %s 已在启动前停止，跳过采集", tag, fs.Name)
 				return
 			}
-			if err := handleCollectWithStopVersion(fs.Id, h, &runVersion, false, false); err != nil {
-				log.Printf("[%s] 采集站点 %s 失败: %v", tag, fs.Name, err)
+			if err := handleCollectWithStopVersion(fs.Id, h, &runVersion, false, false, batch); err != nil {
+				syslog.Errorf("[%s] 采集站点 %s 失败: %v", tag, fs.Name, err)
 			}
 		}(src)
 	}
@@ -1250,15 +1473,16 @@ func runSourcesGroupWithLimit(sources []model.FilmSource, h int, tag string, lim
 
 // HandleCollect 影视采集  id-采集站ID h-时长/h
 func HandleCollect(id string, h int) error {
-	return handleCollectWithStopVersion(id, h, nil, true, false)
+	return handleCollectWithStopVersion(id, h, nil, true, false, nil)
 }
 
 func HandlePreparedCollect(id string, h int) error {
-	return handleCollectWithStopVersion(id, h, nil, true, true)
+	return handleCollectWithStopVersion(id, h, nil, true, true, nil)
 }
 
-func handleCollectWithStopVersion(id string, h int, runVersion *uint64, flushAtEnd bool, allowPreparedStart bool) (retErr error) {
+func handleCollectWithStopVersion(id string, h int, runVersion *uint64, flushAtEnd bool, allowPreparedStart bool, batch *notify.ChangeBatch) (retErr error) {
 	hadWrites := false
+	collectStartedAt := time.Now()
 	if runVersion != nil && isDispatchStopped(*runVersion) {
 		return errors.New("任务已被一键终止，跳过启动")
 	}
@@ -1279,6 +1503,16 @@ func handleCollectWithStopVersion(id string, h int, runVersion *uint64, flushAtE
 		log.Printf("[Spider] 站点 %s 无法启动采集: %v\n", id, err)
 		return err
 	}
+	// 主站采集前兜底：分类被重置/清空后若未同步，影片会以 pid=0 入库并被列表读模型隐藏。
+	if err := ensureMasterCategoriesReady(s); err != nil {
+		retErr = err
+		return err
+	}
+	// 确认可开跑后再开变更批次，避免 early-return 泄漏/误开。
+	// 单站（flushAtEnd）独立开批；批量由 runSourcesWithLimit 统一开启并传入。
+	if flushAtEnd {
+		batch = notify.StartChangeBatch()
+	}
 	isMasterFullCollect := s.Grade == model.MasterCollect && h < 0
 	if isMasterFullCollect {
 		collectLifecycle.beginMasterRebuild(s.Id)
@@ -1292,6 +1526,12 @@ func handleCollectWithStopVersion(id string, h int, runVersion *uint64, flushAtE
 				collectLifecycle.discardPendingMasterMIDs(s.Id)
 			}
 			collectLifecycle.endSource(s.Id)
+			if flushAtEnd {
+				// 未进入统一收尾的单站失败：只发批次摘要。
+				// 即时 source_failed 由熔断路径发送，避免 minInterval=0 时双发。
+				noteSourceError(s.Id, originalErr.Error())
+				emitBatchSummaryForSources(batch, model.NotifyTriggerManual, []model.FilmSource{*s}, collectStartedAt, originalErr)
+			}
 			return
 		}
 		if isMasterFullCollect {
@@ -1316,12 +1556,15 @@ func handleCollectWithStopVersion(id string, h int, runVersion *uint64, flushAtE
 					progress.Status = progressStatusDone
 				}
 			})
+			// 单站采集（flushAtEnd）在收尾后直接发批次摘要
+			emitBatchSummaryForSources(batch, model.NotifyTriggerManual, []model.FilmSource{*s}, collectStartedAt, flushErr)
 			return
 		}
-		// 批量：分页已结束则保持 waiting_publish，等待整批 flushPending。
+		// 批量：分页已结束（含 0 页）统一 waiting_publish，等待整批 flushPending。
 		if !isCollectProgressStopped(s.Id) {
 			updateCollectProgress(s.Id, func(progress *model.CollectProgress) {
-				if progress.Status == progressStatusRunning || progress.Status == progressStatusStarting || progress.Status == progressStatusPageDone {
+				switch progress.Status {
+				case progressStatusRunning, progressStatusStarting, progressStatusPageDone:
 					progress.Status = progressStatusWaitingPublish
 				}
 			})
@@ -1357,6 +1600,9 @@ func handleCollectWithStopVersion(id string, h int, runVersion *uint64, flushAtE
 						return
 					}
 				})
+				if retErr != nil {
+					noteSourceError(id, retErr.Error())
+				}
 				log.Printf("[Spider] 站点 %s 任务结束\n", id)
 			}
 		}
@@ -1380,16 +1626,22 @@ func handleCollectWithStopVersion(id string, h int, runVersion *uint64, flushAtE
 	if err != nil {
 		return err
 	}
-	// pageCount = 0 说明该站点在当前时间段内无新数据，任务无需执行
+	// pageCount = 0：时段内无新数据，无分页可跑。
+	// 单站：page_done，由 defer 立即 finalizing→done；
+	// 批量：waiting_publish，与有数据的源一样等整批 flushPending，列表状态与生命周期一致。
 	if pageCount <= 0 {
 		updateCollectProgress(id, func(progress *model.CollectProgress) {
 			progress.Total = 0
 			progress.Current = 0
 			progress.Success = 0
 			progress.Failed = 0
-			progress.Status = progressStatusDone
+			if flushAtEnd {
+				progress.Status = progressStatusPageDone
+			} else {
+				progress.Status = progressStatusWaitingPublish
+			}
 		})
-		log.Printf("[Spider] 站点 %s 无需采集 (pageCount=%d，可能该时间段内无新内容)\n", s.Name, pageCount)
+		log.Printf("[Spider] 站点 %s 无需分页 (pageCount=%d，该时间段无新内容) flushAtEnd=%v\n", s.Name, pageCount, flushAtEnd)
 		return nil
 	}
 	updateCollectProgress(id, func(progress *model.CollectProgress) {
@@ -1402,7 +1654,7 @@ func handleCollectWithStopVersion(id string, h int, runVersion *uint64, flushAtE
 	log.Printf("[Spider] 站点 %s 共 %d 页，开始采集...\n", s.Name, pageCount)
 
 	pageWorkerLimit := getSourcePageConcurrency(s)
-	hadWrites, err = collectFilmPages(ctx, pageCount, pageWorkerLimit, s, h)
+	hadWrites, err = collectFilmPages(ctx, pageCount, pageWorkerLimit, s, h, flushAtEnd, batch)
 	if err != nil {
 		return err
 	}
@@ -1412,21 +1664,24 @@ func handleCollectWithStopVersion(id string, h int, runVersion *uint64, flushAtE
 		// 分页阶段完成：单站 → page_done；批量 → waiting_publish（defer 中也会兜底）。
 		markSourcePagesFinished(id, flushAtEnd)
 	}
-	if s.Grade == model.MasterCollect && s.SyncPictures {
-		triggerPictureSync()
-	}
-
 	return nil
 }
 
-func triggerPictureSync() {
-	if !pictureSyncRunning.CompareAndSwap(false, true) {
-		return
+// ensureMasterCategoriesReady 在主站影片采集前确保本地分类与映射可用。
+// 仅在分类表为空时触发，避免覆盖用户已调整的业务分类属性。
+func ensureMasterCategoriesReady(s *model.FilmSource) error {
+	if s == nil || s.Grade != model.MasterCollect {
+		return nil
 	}
-	go func() {
-		defer pictureSyncRunning.Store(false)
-		repository.SyncFilmPicture()
-	}()
+	if repository.ExistsCategoryTree() {
+		return nil
+	}
+	log.Printf("[Spider] 分类为空，采集前自动同步主站分类: name=%s id=%s uri=%s", s.Name, s.Id, s.Uri)
+	if err := CollectCategory(s); err != nil {
+		return fmt.Errorf("采集前同步主站分类失败: %w", err)
+	}
+	log.Printf("[Spider] 采集前主站分类同步完成: name=%s id=%s", s.Name, s.Id)
+	return nil
 }
 
 // CollectCategory 影视分类采集
@@ -1441,6 +1696,10 @@ func ResetCategory(s *model.FilmSource) error {
 func collectCategoryWithMode(s *model.FilmSource, preserveBusinessFields bool) error {
 	if s == nil {
 		return errors.New("采集站信息不存在")
+	}
+	// 硬约束：分类树只能来自主站，禁止附属站写入分类树
+	if s.Grade != model.MasterCollect {
+		return fmt.Errorf("分类树只能从主采集站同步，当前站 grade=%d name=%s", s.Grade, s.Name)
 	}
 	// 获取分类树形数据
 	categoryTree, err := spiderCore.GetCategoryTree(utils.RequestInfo{Uri: s.Uri, Params: url.Values{}})
@@ -1459,26 +1718,24 @@ func collectCategoryWithMode(s *model.FilmSource, preserveBusinessFields bool) e
 	return nil
 }
 
-func saveVirtualPicturesIfEnabled(s *model.FilmSource, list []model.MovieDetail) error {
-	if s.SyncPictures {
-		if err := repository.SaveVirtualPic(conver.ConvertVirtualPicture(list)); err != nil {
-			return fmt.Errorf("save virtual pictures failed: %w", err)
-		}
-	}
-	return nil
-}
 
-func saveSlavePlaylists(ctx context.Context, s *model.FilmSource, page int, list []model.MovieDetail) error {
+func saveSlavePlaylists(ctx context.Context, s *model.FilmSource, page int, list []model.MovieDetail) ([]int64, error) {
 	lock := getSourceWriteLock(s.Id)
 	lock.Lock()
 	defer lock.Unlock()
+	var changedMids []int64
 	err := runCollectDBWriteWithRetry(ctx, s.Name, page, func() error {
-		return filmrepo.SaveSitePlayList(s.Id, list)
+		mids, err := filmrepo.SaveSitePlayList(s.Id, list)
+		if err != nil {
+			return err
+		}
+		changedMids = mids
+		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("save slave playlists failed: %w", err)
+		return nil, fmt.Errorf("save slave playlists failed: %w", err)
 	}
-	return nil
+	return changedMids, nil
 }
 
 // saveCollectedFilm 将已采集的 list 按站点类型写入存储，消除 collectFilm/collectFilmById 中的重复 switch 块。
@@ -1492,37 +1749,49 @@ func saveCollectedFilm(s *model.FilmSource, list []model.MovieDetail, saveMaster
 		if err := saveMaster(s.Id, list); err != nil {
 			return fmt.Errorf("save master details failed: %w", err)
 		}
-		return saveVirtualPicturesIfEnabled(s, list)
+		return nil
 	case model.SlaveCollect:
-		return saveSlavePlaylists(context.Background(), s, 0, list)
+		_, err := saveSlavePlaylists(context.Background(), s, 0, list)
+		return err
 	}
 	return nil
 }
 
-func saveCollectedFilmForCollect(ctx context.Context, s *model.FilmSource, page int, list []model.MovieDetail) ([]int64, error) {
+// collectWriteMids 采集写结果。
+// Notify：进 Telegram「更新列表」——主站新片/任一线路最后一项分集标签变化，
+// 或附属站已匹配主站片的 playlist 最后一项分集标签变化（含新增/回退）；
+// Affected：快照/缓存收尾用 mid。
+type collectWriteMids struct {
+	Notify   []int64
+	Affected []int64
+}
+
+func saveCollectedFilmForCollect(ctx context.Context, s *model.FilmSource, page int, list []model.MovieDetail) (collectWriteMids, error) {
 	if s.Grade != model.MasterCollect {
-		return nil, saveSlavePlaylists(ctx, s, page, list)
+		// 附属站：扩展主站播放源；最后一项分集标签变化且已匹配主站 mid 的，进更新列表（仅链接/中间集变化不进）
+		mids, err := saveSlavePlaylists(ctx, s, page, list)
+		if err != nil {
+			return collectWriteMids{}, err
+		}
+		return collectWriteMids{Notify: mids, Affected: mids}, nil
 	}
 
-	var affectedPids []int64
+	var result filmrepo.CollectWriteResult
 	lock := getSourceWriteLock(s.Id)
 	lock.Lock()
 	defer lock.Unlock()
 	err := runCollectDBWriteWithRetry(ctx, s.Name, page, func() error {
-		pids, err := filmrepo.SaveDetailsForCollect(s.Id, list)
+		r, err := filmrepo.SaveDetailsForCollect(s.Id, list)
 		if err != nil {
 			return err
 		}
-		affectedPids = pids
+		result = r
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("save master details failed: %w", err)
+		return collectWriteMids{}, fmt.Errorf("save master details failed: %w", err)
 	}
-	if err := saveVirtualPicturesIfEnabled(s, list); err != nil {
-		return nil, err
-	}
-	return affectedPids, nil
+	return collectWriteMids{Notify: result.NotifyMIDs, Affected: result.AffectedMIDs}, nil
 }
 
 func saveFilmPageFailure(s *model.FilmSource, h, pg int, phase string, err error) {
@@ -1539,7 +1808,7 @@ func saveFilmPageFailure(s *model.FilmSource, h, pg int, phase string, err error
 		Status:     model.FailureRecordStatusPending,
 	})
 	if recordErr != nil {
-		log.Printf("[Spider][Failure] 失败页记录保存失败 source_id=%s source=%s page=%d hour=%d phase=%s err=%v record_err=%v", s.Id, s.Name, pg, h, phase, err, recordErr)
+		syslog.Errorf("[Spider][Failure] 失败页记录保存失败 source_id=%s source=%s page=%d hour=%d phase=%s err=%v record_err=%v", s.Id, s.Name, pg, h, phase, err, recordErr)
 	}
 }
 
@@ -1567,7 +1836,8 @@ func buildPageRequest(s *model.FilmSource, h, pg int) utils.RequestInfo {
 }
 
 // collectFilmPages 将请求与写库拆成流水线：请求并发执行，写库交给全局调度器按批次串行落库。
-func collectFilmPages(parentCtx context.Context, pageCount int, requestWorkerLimit int, s *model.FilmSource, h int) (bool, error) {
+// flushAtEnd=true 为单站采集（独立批次+即时告警）；false 为批量采集（失败并入整批概要）。
+func collectFilmPages(parentCtx context.Context, pageCount int, requestWorkerLimit int, s *model.FilmSource, h int, flushAtEnd bool, batch *notify.ChangeBatch) (bool, error) {
 	if pageCount <= 0 {
 		return false, nil
 	}
@@ -1633,10 +1903,17 @@ func collectFilmPages(parentCtx context.Context, pageCount int, requestWorkerLim
 		}
 		stopOnce.Do(func() {
 			stopErr = fmt.Errorf("站点 %s 连续采集失败 %d 次，已终止本次采集", s.Name, collectSourceConsecutiveFailureLimit)
-			log.Printf("[Spider] 站点 %s 连续失败达到阈值，终止采集 page=%d stage=%s err=%v", s.Name, page, stage, err)
+			syslog.Errorf("[Spider] 站点 %s 连续失败达到阈值，终止采集 page=%d stage=%s err=%v", s.Name, page, stage, err)
 			updateCollectProgress(s.Id, func(progress *model.CollectProgress) {
 				progress.Status = progressStatusFailed
 			})
+			// 批量采集且批次概要开启时，失败并入整批概要，避免逐源即时告警轰炸；
+			// 单站采集或概要事件关闭时保持即时告警。
+			if flushAtEnd || !notify.IsEventEnabled(model.NotifyEventCollectBatchSummary) {
+				emitSourceFailedNotify(s.Id, s.Name, stopErr.Error())
+			} else {
+				noteSourceError(s.Id, stopErr.Error())
+			}
 			cancel()
 		})
 	}
@@ -1669,20 +1946,22 @@ func collectFilmPages(parentCtx context.Context, pageCount int, requestWorkerLim
 		})
 		saveFilmPageFailure(s, h, page, stage, err)
 		if shouldLogCollectFailure(snapshot.failed) {
-			log.Printf("[Spider] 站点 %s 采集失败累计=%d，最近失败 page=%d stage=%s err=%v", s.Name, snapshot.failed, page, stage, err)
+			syslog.Warnf("[Spider] 站点 %s 采集失败累计=%d，最近失败 page=%d stage=%s err=%v", s.Name, snapshot.failed, page, stage, err)
 		}
 		recordFailure(page, stage, err)
 		logProgress(false)
 	}
-	recordPageSuccess := func(page int, mids []int64) {
+	recordPageSuccess := func(page int, notifyMIDs, affectedMIDs []int64) {
 		snapshot := recordPageFinished(page, true)
 		recordSuccess()
+		// 更新列表记 Notify mid；快照/缓存收尾用 Affected
+		noteCollectedMIDs(batch, s.Id, s.Name, notifyMIDs)
 		if s.Grade == model.MasterCollect && h < 0 {
-			collectLifecycle.addPendingMasterMIDs(s.Id, mids)
+			collectLifecycle.addPendingMasterMIDs(s.Id, affectedMIDs)
 		} else if s.Grade == model.MasterCollect {
-			collectLifecycle.addMasterAffectedMIDs(mids)
+			collectLifecycle.addMasterAffectedMIDs(affectedMIDs)
 		} else {
-			collectLifecycle.addAffectedMIDs(mids)
+			collectLifecycle.addAffectedMIDs(affectedMIDs)
 		}
 		updateCollectProgress(s.Id, func(progress *model.CollectProgress) {
 			progress.Success = snapshot.success
@@ -1736,7 +2015,7 @@ func collectFilmPages(parentCtx context.Context, pageCount int, requestWorkerLim
 						sourceName: s.Name,
 						grade:      s.Grade,
 						page:       page,
-						write: func() ([]int64, error) {
+						write: func() (collectWriteMids, error) {
 							return saveCollectedFilmForCollect(context.Background(), s, page, items)
 						},
 						complete: func(completion collectWriteCompletion) {
@@ -1769,7 +2048,7 @@ func collectFilmPages(parentCtx context.Context, pageCount int, requestWorkerLim
 			recordPageFailure(completion.page, completion.stage, completion.err)
 			continue
 		}
-		recordPageSuccess(completion.page, completion.mids)
+		recordPageSuccess(completion.page, completion.notifyMIDs, completion.affectedMIDs)
 	}
 	logProgress(true)
 	if ctx.Err() != nil {
@@ -1788,14 +2067,14 @@ func shouldSkipCollectPublishOnError(source model.FilmSource, h int) bool {
 	return source.Grade == model.MasterCollect && h < 0
 }
 
-// collectFilmById 采集指定ID的影片信息
-func collectFilmById(ids string, s *model.FilmSource, flushAtEnd bool) (retErr error) {
+// collectFilmById 采集指定ID的影片信息，返回实质变更的全局 mid（无变更则空）。
+func collectFilmById(ids string, s *model.FilmSource, flushAtEnd bool) (changedMids []int64, retErr error) {
 	if s == nil {
-		return errors.New("采集站信息不存在")
+		return nil, errors.New("采集站信息不存在")
 	}
 	if err := collectLifecycle.beginSource(s.Id); err != nil {
 		log.Printf("[Spider] 站点 %s 无法启动单片采集: %v\n", s.Id, err)
-		return err
+		return nil, err
 	}
 	defer func() {
 		if flushAtEnd {
@@ -1810,7 +2089,7 @@ func collectFilmById(ids string, s *model.FilmSource, flushAtEnd bool) (retErr e
 
 	release, err := waitSourceRequestTurn(context.Background(), s, fmt.Sprintf("单片请求 ids=%s ", ids))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	r := utils.RequestInfo{Uri: s.Uri, Params: url.Values{}}
 	r.Params.Set("pg", "1")
@@ -1818,23 +2097,62 @@ func collectFilmById(ids string, s *model.FilmSource, flushAtEnd bool) (retErr e
 	list, err := spiderCore.GetFilmDetail(r)
 	if err != nil {
 		release(err)
-		return fmt.Errorf("get movie detail failed: %w", err)
+		return nil, fmt.Errorf("get movie detail failed: %w", err)
 	}
 	if len(list) <= 0 {
 		release(errors.New("response list is empty"))
-		return errors.New("get movie detail failed: response list is empty")
+		return nil, errors.New("get movie detail failed: response list is empty")
 	}
 	release(nil)
-	if err := saveCollectedFilm(s, list, func(id string, l []model.MovieDetail) error {
-		return filmrepo.SaveDetail(id, l[0])
-	}); err != nil {
-		return err
+
+	// 与批量路径一致：Notify 供更新列表；Affected 供收尾
+	written, err := saveCollectedFilmForCollect(context.Background(), s, 1, list)
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	if s.Grade == model.MasterCollect {
+		collectLifecycle.addMasterAffectedMIDs(written.Affected)
+	} else {
+		collectLifecycle.addAffectedMIDs(written.Affected)
+	}
+	return written.Notify, nil
+}
+
+// PrepareBatchCollectStart 同步过滤可采站点并标记 starting（0%），供接口立即返回后列表可见进度。
+// 返回已标记的站点列表；调用方应在 goroutine 中执行 BatchCollectPrepared。
+func PrepareBatchCollectStart(ids []string) ([]model.FilmSource, error) {
+	sources := make([]model.FilmSource, 0, len(ids))
+	for _, id := range ids {
+		if fs := repository.FindCollectSourceById(id); fs != nil && fs.State {
+			sources = append(sources, *fs)
+		}
+	}
+	sources = filterCollectableSources(sources, "Batch-Collect")
+	if len(sources) == 0 {
+		return nil, fmt.Errorf("没有可启动的采集站（均未启用或已在采集中）")
+	}
+	markSourcesCollectStarting(sources)
+	return sources, nil
+}
+
+// BatchCollectPrepared 对已 Prepare 的站点执行批量采集（不再二次 filter/mark）。
+func BatchCollectPrepared(trigger string, h int, sources []model.FilmSource) {
+	if len(sources) == 0 {
+		return
+	}
+	if trigger == "" {
+		trigger = model.NotifyTriggerManual
+	}
+	runSourcesWithLimitCore(sources, h, "Batch-Collect", trigger)
 }
 
 // BatchCollect 批量采集, 采集指定的所有站点最近x小时内更新的数据
 func BatchCollect(h int, ids ...string) {
+	BatchCollectTriggered(model.NotifyTriggerManual, h, ids...)
+}
+
+// BatchCollectTriggered 带通知 trigger 的批量采集。
+func BatchCollectTriggered(trigger string, h int, ids ...string) {
 	sources := make([]model.FilmSource, 0)
 	for _, id := range ids {
 		if fs := repository.FindCollectSourceById(id); fs != nil && fs.State {
@@ -1845,8 +2163,10 @@ func BatchCollect(h int, ids ...string) {
 	if len(sources) == 0 {
 		return
 	}
-
-	runSourcesWithLimit(sources, h, "Batch-Collect")
+	if trigger == "" {
+		trigger = model.NotifyTriggerManual
+	}
+	runSourcesWithLimit(sources, h, "Batch-Collect", trigger)
 }
 
 func filterEnabledSources(sources []model.FilmSource) []model.FilmSource {
@@ -1865,22 +2185,33 @@ func getEnabledSourcesByGrade(grade model.SourceGrade) []model.FilmSource {
 
 // AutoCollect 自动进行对所有已启用站点的采集任务
 func AutoCollect(h int) {
+	AutoCollectTriggered(model.NotifyTriggerManual, h)
+}
+
+// AutoCollectTriggered 带通知 trigger 的自动采集。
+func AutoCollectTriggered(trigger string, h int) {
 	enabled := filterEnabledSources(repository.GetCollectSourceList())
 	if len(enabled) == 0 {
 		log.Println("[Spider] 自动采集：未找到任何启用的站点")
 		return
 	}
-
-	runSourcesWithLimit(enabled, h, "Auto-Collect")
+	if trigger == "" {
+		trigger = model.NotifyTriggerManual
+	}
+	runSourcesWithLimit(enabled, h, "Auto-Collect", trigger)
 }
 
 // ClearSpider 删除所有已采集的影片信息，并与采集写库互斥。
 func ClearSpider() error {
+	filmrepo.ReportResetProgress(5, "正在停止采集任务")
 	StopAllTasks()
 	if err := collectLifecycle.waitIdle(time.Second * 30); err != nil {
 		return err
 	}
+	filmrepo.ReportResetProgress(15, "正在清空数据")
 	return collectLifecycle.runExclusive(func() error {
+		// 清空采集统计合并缓冲，防止清表后内存 pending 的旧统计回写复活
+		repository.ResetCollectStatsCoalescer()
 		return filmrepo.FilmZero()
 	})
 }
@@ -1900,6 +2231,16 @@ func CollectSingleFilm(ids string) {
 		return
 	}
 
+	startedAt := time.Now()
+	batch := notify.StartChangeBatch()
+	type singleResult struct {
+		source model.FilmSource
+		err    error
+	}
+	var (
+		mu      sync.Mutex
+		results []singleResult
+	)
 	var wg sync.WaitGroup
 	for _, source := range enabled {
 		requestID := resolveSingleCollectSourceMid(globalMid, source)
@@ -1910,13 +2251,65 @@ func CollectSingleFilm(ids string) {
 		wg.Add(1)
 		go func(src model.FilmSource, sourceMid string) {
 			defer wg.Done()
-			if err := collectFilmById(sourceMid, &src, false); err != nil {
-				log.Printf("[Spider] CollectSingleFilm 站点 %s 更新失败: %v", src.Name, err)
+			mids, err := collectFilmById(sourceMid, &src, false)
+			if err != nil {
+				syslog.Errorf("[Spider] CollectSingleFilm 站点 %s 更新失败: %v", src.Name, err)
+			} else if len(mids) > 0 {
+				// 主站结构变更/新片，或附属站已匹配主站片的播放源结构变更
+				noteCollectedMIDs(batch, src.Id, src.Name, mids)
 			}
+			mu.Lock()
+			results = append(results, singleResult{source: src, err: err})
+			mu.Unlock()
 		}(source, requestID)
 	}
 	wg.Wait()
-	flushSourcesPending("CollectSingleFilm", enabled)
+
+	// 收尾发布（不经 emitBatchSummary，避免把未尝试的 enabled 源默认成成功）
+	attempted := make([]model.FilmSource, 0, len(results))
+	for _, r := range results {
+		attempted = append(attempted, r.source)
+	}
+	var finalizeErr error
+	if len(attempted) > 0 {
+		// 复用 flush 但不发摘要：先 flush 再手动发
+		flushMap := make(map[string]model.FilmSource, len(attempted))
+		for _, s := range attempted {
+			flushMap[s.Id] = s
+		}
+		if err := collectLifecycle.runFlush(func(affectedMIDs []int64, masterMIDs []int64) error {
+			_, _, err := flushPendingSources(flushMap, affectedMIDs, masterMIDs)
+			return err
+		}); err != nil {
+			syslog.Errorf("[CollectSingleFilm] 收尾刷新失败: %v", err)
+			finalizeErr = err
+		}
+	}
+
+	notifyResults := make([]model.SourceNotifyResult, 0, len(results))
+	for _, r := range results {
+		status := progressStatusDone
+		errMsg := ""
+		if r.err != nil {
+			status = progressStatusFailed
+			errMsg = r.err.Error()
+		} else if finalizeErr != nil {
+			// 写库成功但收尾失败
+			status = progressStatusFailed
+			errMsg = finalizeErr.Error()
+		}
+		notifyResults = append(notifyResults, notify.BuildSourceResultDirect(r.source, status, errMsg))
+	}
+	if len(notifyResults) == 0 {
+		// 全部源映射不到：发一条失败摘要便于感知
+		notifyResults = append(notifyResults, model.SourceNotifyResult{
+			SourceName: "单片更新",
+			Status:     progressStatusFailed,
+			Error:      fmt.Sprintf("影片 #%d 未匹配到任何启用站点的 source_mid", globalMid),
+			FailedCnt:  1,
+		})
+	}
+	emitBatchSummaryDirect(batch, model.NotifyTriggerSingleUpdate, notifyResults, startedAt, finalizeErr)
 }
 
 func resolveSingleCollectSourceMid(globalMid int64, source model.FilmSource) string {
@@ -1934,7 +2327,7 @@ func resolveSingleCollectSourceMid(globalMid int64, source model.FilmSource) str
 }
 
 // recoverFilmPage 重试单条失败页：成功后出队，失败未达上限时继续保留待重试。
-func recoverFilmPage(ctx context.Context, s *model.FilmSource, fr *model.FailureRecord) {
+func recoverFilmPage(ctx context.Context, s *model.FilmSource, fr *model.FailureRecord, batch *notify.ChangeBatch) {
 	if s == nil || fr == nil {
 		return
 	}
@@ -1956,16 +2349,17 @@ func recoverFilmPage(ctx context.Context, s *model.FilmSource, fr *model.Failure
 		return
 	}
 
-	mids, err := saveCollectedFilmForCollect(ctx, s, fr.PageNumber, list)
+	written, err := saveCollectedFilmForCollect(ctx, s, fr.PageNumber, list)
 	if err != nil {
 		markRecoverFailure(s, fr, "recover_save", err)
 		log.Println("Recover saveCollectedFilm Error: ", err)
 		return
 	}
+	noteCollectedMIDs(batch, s.Id, s.Name, written.Notify)
 	if s.Grade == model.MasterCollect {
-		collectLifecycle.addMasterAffectedMIDs(mids)
+		collectLifecycle.addMasterAffectedMIDs(written.Affected)
 	} else {
-		collectLifecycle.addAffectedMIDs(mids)
+		collectLifecycle.addAffectedMIDs(written.Affected)
 	}
 	repository.UpdateFailureRecordStatus(fr, model.FailureRecordStatusSuccess)
 }
@@ -1977,11 +2371,11 @@ func markRecoverFailure(s *model.FilmSource, fr *model.FailureRecord, phase stri
 	cause := fmt.Sprintf("%s: %v", phase, err)
 	final, retryCount, updateErr := repository.MarkFailureRecordRetryFailed(fr, cause, recoverMaxRetryCount)
 	if updateErr != nil {
-		log.Printf("[Spider][Recover] 失败记录更新失败 source_id=%s source=%s page=%d hour=%d err=%v", s.Id, s.Name, fr.PageNumber, fr.Hour, updateErr)
+		syslog.Errorf("[Spider][Recover] 失败记录更新失败 source_id=%s source=%s page=%d hour=%d err=%v", s.Id, s.Name, fr.PageNumber, fr.Hour, updateErr)
 		return
 	}
 	if final {
-		log.Printf("[Spider][Recover] 失败页达到最大自动重试次数 source_id=%s source=%s page=%d hour=%d retry_count=%d", s.Id, s.Name, fr.PageNumber, fr.Hour, retryCount)
+		syslog.Warnf("[Spider][Recover] 失败页达到最大自动重试次数 source_id=%s source=%s page=%d hour=%d retry_count=%d", s.Id, s.Name, fr.PageNumber, fr.Hour, retryCount)
 	}
 }
 
@@ -1992,19 +2386,32 @@ func SingleRecoverSpider(fr *model.FailureRecord) {
 	// 仅对当前失败记录所属站点+失败页进行重试，不干扰正在运行的采集任务
 	s := repository.FindCollectSourceById(fr.OriginId)
 	if s == nil {
-		log.Printf("[Spider] 重试失败: 站点 %s 不存在\n", fr.OriginId)
+		syslog.Errorf("[Spider] 重试失败: 站点 %s 不存在", fr.OriginId)
 		return
 	}
+	startedAt := time.Now()
+	batch := notify.StartChangeBatch()
 	if err := collectLifecycle.waitAndBeginSource(s.Id); err != nil {
-		log.Printf("[Spider] 站点 %s 无法启动失败页重试: %v\n", s.Id, err)
+		syslog.Errorf("[Spider] 站点 %s 无法启动失败页重试: %v", s.Id, err)
+		// 概要事件开启时由概要承载失败信息，避免与即时告警双发；关闭时退回即时告警
+		if notify.IsEventEnabled(model.NotifyEventCollectBatchSummary) {
+			emitBatchSummaryDirect(batch, model.NotifyTriggerRecover, []model.SourceNotifyResult{
+				notify.BuildSourceResultDirect(*s, progressStatusFailed, err.Error()),
+			}, startedAt, err)
+		} else {
+			emitSourceFailedNotify(s.Id, s.Name, err.Error())
+		}
 		return
 	}
+	var finalizeErr error
 	defer func() {
 		if err := collectLifecycle.finishSourceAndFlush(*s); err != nil {
-			log.Printf("[Spider] 站点 %s 失败页重试收尾刷新失败: %v\n", s.Id, err)
+			syslog.Errorf("[Spider] 站点 %s 失败页重试收尾刷新失败: %v", s.Id, err)
+			finalizeErr = err
 		}
+		emitBatchSummaryForSources(batch, model.NotifyTriggerRecover, []model.FilmSource{*s}, startedAt, finalizeErr)
 	}()
-	recoverFilmPage(context.Background(), s, fr)
+	recoverFilmPage(context.Background(), s, fr, batch)
 }
 
 // FullRecoverSpider 扫描记录表中的失败记录, 并发重试各失败页
@@ -2014,17 +2421,23 @@ func FullRecoverSpider() {
 	seen := make(map[string]struct{}, len(list))
 	recordsBySource := make(map[string][]model.FailureRecord, len(list))
 	sourceByID := make(map[string]model.FilmSource, len(list))
-	limit := config.MAXGoroutine
+	limit := config.CollectPageWorkers
+	if limit <= 0 {
+		limit = config.DefaultCollectPageWorkers
+	}
 	if limit <= 0 {
 		limit = 1
 	}
 	sem := make(chan struct{}, limit)
 	var wg sync.WaitGroup
+	startedAt := time.Now()
+	// 恢复重试同样开变更批次，避免失败页变更 mid 丢失
+	batch := notify.StartChangeBatch()
 	for i := range list {
 		fr := list[i]
 		s := repository.FindCollectSourceById(fr.OriginId)
 		if s == nil {
-			log.Printf("[Spider] 重试失败: 站点 %s 不存在\n", fr.OriginId)
+			syslog.Errorf("[Spider] 重试失败: 站点 %s 不存在", fr.OriginId)
 			continue
 		}
 		if _, ok := seen[s.Id]; !ok {
@@ -2046,29 +2459,37 @@ func FullRecoverSpider() {
 			defer wg.Done()
 			defer func() { <-sem }()
 			if err := collectLifecycle.waitAndBeginSource(source.Id); err != nil {
-				log.Printf("[Spider] 站点 %s 无法启动失败页重试: %v\n", source.Id, err)
+				syslog.Errorf("[Spider] 站点 %s 无法启动失败页重试: %v", source.Id, err)
 				return
 			}
 			defer collectLifecycle.endSource(source.Id)
 			for i := range pending {
 				record := pending[i]
-				recoverFilmPage(context.Background(), &source, &record)
+				recoverFilmPage(context.Background(), &source, &record, batch)
 			}
 		}(src, recordsCopy)
 	}
 	wg.Wait()
-	flushSourcesPending("FullRecoverSpider", sourcesToFlush)
+	flushSourcesPending("FullRecoverSpider", model.NotifyTriggerRecover, sourcesToFlush, startedAt, batch)
 }
 
 // ======================================================= 公共方法  =======================================================
 
 // CollectApiTest 测试采集接口是否可用
 func CollectApiTest(s model.FilmSource) error {
+	return CollectApiTestWithTimeout(s, 0)
+}
+
+// CollectApiTestWithTimeout 测试采集接口是否可用；timeoutSeconds > 0 时使用指定请求超时（秒）。
+func CollectApiTestWithTimeout(s model.FilmSource, timeoutSeconds int) error {
 	// 使用 ac=list 测试：获取分类列表，所有标准 Mac CMS 站均支持，
 	// 且不需要额外过滤参数（ac=detail 在无 h/t 参数时部分站点会返回 400）
 	r := utils.RequestInfo{Uri: s.Uri, Params: url.Values{}}
 	r.Params.Set("ac", "list")
 	r.Params.Set("pg", "1")
+	if timeoutSeconds > 0 {
+		r.Header = map[string][]string{"timeout": {strconv.Itoa(timeoutSeconds)}}
+	}
 	err := utils.ApiTest(&r)
 	// 首先核对接口返回值类型
 	if err == nil {
@@ -2096,7 +2517,6 @@ func GetActiveTaskProgress() []model.CollectProgress {
 
 	list := make([]model.CollectProgress, 0)
 	seen := make(map[string]struct{})
-	retainFor := progressRetainDuration()
 	staleAfter := progressStaleDuration()
 	now := time.Now()
 
@@ -2118,41 +2538,54 @@ func GetActiveTaskProgress() []model.CollectProgress {
 		state := value.(*collectProgressState)
 		state.mu.Lock()
 		progress := state.data
-		updated := state.updated
-		age := now.Sub(updated)
+		age := now.Sub(state.updated)
 
-		// 活跃但已超时且无 live task → 就地 failed，仍可按 retain 短暂展示。
+		// 无 live 的 starting/running 超时 → failed；waiting_publish 等收尾态不超时。
 		if isActiveCollectStatus(progress.Status) {
 			_, live := activeTasks.Load(id)
-			liveFetch := live && (progress.Status == progressStatusRunning || progress.Status == progressStatusStarting)
-			if !liveFetch && age >= staleAfter {
+			if shouldMarkProgressStale(progress.Status, live, age, staleAfter) {
 				old := progress.Status
+				name := progress.Name
 				progress.Status = progressStatusFailed
 				state.data.Status = progressStatusFailed
 				state.updated = now
-				updated = now
 				log.Printf("[Spider] 进度超时清理 source=%s status=%s age=%s -> failed", id, old, age.Round(time.Second))
-			} else {
 				state.mu.Unlock()
+				emitProgressStaleNotify(id, name, old, age)
 				list = append(list, progress)
 				return true
 			}
+			state.mu.Unlock()
+			list = append(list, progress)
+			return true
 		}
 
-		if progress.Status == progressStatusDone || progress.Status == progressStatusFailed || progress.Status == progressStatusStopped {
-			if now.Sub(updated) < retainFor {
-				state.mu.Unlock()
-				list = append(list, progress)
-				return true
-			}
-			// 超过保留窗口：删除，避免 map 无限增长。
+		// 终态：有活跃采集时一律保留；全部结束后由 maybePurge 统一清空。
+		if isTerminalCollectStatus(progress.Status) {
 			state.mu.Unlock()
-			collectProgress.Delete(id)
+			list = append(list, progress)
 			return true
 		}
 		state.mu.Unlock()
 		return true
 	})
+
+	// 列表读取时也尝试统一清理，避免仅依赖后台 ticker。
+	maybePurgeTerminalProgressTogether(now)
+	// purge 后剔除 map 中已不存在的终态快照
+	if n := len(list); n > 0 {
+		filtered := list[:0]
+		for _, p := range list {
+			if isTerminalCollectStatus(p.Status) {
+				if _, still := collectProgress.Load(p.Id); !still {
+					continue
+				}
+			}
+			filtered = append(filtered, p)
+		}
+		list = filtered
+	}
+
 	return list
 }
 
@@ -2189,7 +2622,7 @@ func StopAllTasks() {
 
 func finalizeStoppedCollectTasks() {
 	if err := collectLifecycle.flushPending(); err != nil {
-		log.Printf("[Spider] 终止采集后收尾刷新失败: %v", err)
+		syslog.Errorf("[Spider] 终止采集后收尾刷新失败: %v", err)
 	}
 }
 

@@ -10,6 +10,9 @@ services:
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-ecohub}
     volumes:
       - eco-mysql-data:/var/lib/mysql
+    # 仅本机映射，方便宿主机 go run 本地开发；全容器部署仍走 Eco-network 服务名
+    ports:
+      - "127.0.0.1:3306:3306"
     networks:
       - Eco-network
     healthcheck:
@@ -32,6 +35,9 @@ services:
     command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-ecohub}"]
     volumes:
       - eco-redis-data:/data
+    # 仅本机映射，方便宿主机 go run 本地开发；全容器部署仍走 Eco-network 服务名
+    ports:
+      - "127.0.0.1:6379:6379"
     networks:
       - Eco-network
     healthcheck:
@@ -77,6 +83,13 @@ services:
       REDIS_PORT: ${REDIS_PORT:-6379}
       REDIS_PASSWORD: ${REDIS_PASSWORD:-ecohub}
       REDIS_DB: ${REDIS_DB:-0}
+      # Telegram 专用代理（可选；通用代理 HTTPS_PROXY 等供采集等网络请求使用）
+      TG_PROXY: ${TG_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      ALL_PROXY: ${ALL_PROXY:-}
+      # 采集档位（可选；默认 auto 按容器 CPU 核数自动选档）
+      COLLECT_PROFILE: ${COLLECT_PROFILE:-auto}
     ports:
       - 0.0.0.0:${SERVER_PUBLIC_PORT:-18080}:${SERVER_PORT:-8080}
     networks:

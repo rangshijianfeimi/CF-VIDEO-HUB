@@ -6,6 +6,7 @@ import (
 
 	"server/internal/config"
 	"server/internal/infra/db"
+	"server/internal/infra/syslog"
 	"server/internal/model"
 	"server/internal/repository"
 	filmrepo "server/internal/repository/film"
@@ -32,6 +33,8 @@ func (s *InitService) DefaultDataInit() {
 			&model.VirtualPictureQueue{}, &model.FilmSource{}, &model.CollectSourceStats{}, &model.SearchTagItem{},
 			&model.CrontabRecord{}, &model.SiteConfigRecord{}, &model.MovieSourceMapping{},
 			&model.Banner{}, &model.CronSourceRel{}, &model.MappingRule{}, &model.CategoryMapping{}, &model.SourceCategory{},
+			&model.NotifyConfigRecord{},
+			&model.NotifyChangeBatch{}, &model.NotifyChangeMid{},
 		)
 	}
 	ensureMappingRuleIndexes()
@@ -39,9 +42,11 @@ func (s *InitService) DefaultDataInit() {
 	repository.InitMappingEngine()
 	repository.InitMainCategories()
 	repository.InitBuiltinAccounts()
+	// 一次性清理历史采集同步图库（素材中心仅保留用户上传）
+	repository.PurgeSyncedGallery()
 
-	s.BasicConfigInit()
-	s.BannersInit()
+	// 网站基本信息初始化（首页轮播已移入内容管理）
+	s.SiteWebConfigInit()
 	s.SpiderInit()
 	s.ensureFilmListSnapshot()
 	s.loadActiveFilmReadModel()
@@ -49,13 +54,13 @@ func (s *InitService) DefaultDataInit() {
 
 func (s *InitService) ensureFilmListSnapshot() {
 	if err := filmrepo.EnsureActiveFilmListSnapshot(); err != nil {
-		log.Printf("[Init] 前台影片列表快照引导失败: %v", err)
+		syslog.Errorf("[Init] 前台影片列表快照引导失败: %v", err)
 	}
 }
 
 func (s *InitService) loadActiveFilmReadModel() {
 	if err := filmrepo.LoadActiveFilmReadModel(""); err != nil {
-		log.Printf("[Init] 影片内存读模型加载失败: %v", err)
+		syslog.Errorf("[Init] 影片内存读模型加载失败: %v", err)
 	}
 }
 
@@ -63,12 +68,17 @@ func clearStartupCaches() {
 	ctx := db.Cxt
 	iter := db.Rdb.Scan(ctx, 0, config.RedisProjectKeyPattern, config.MaxScanCount).Iterator()
 	for iter.Next(ctx) {
-		if err := db.Rdb.Del(ctx, iter.Val()).Err(); err != nil {
-			log.Printf("[Init] Redis 键删除失败 %s: %v", iter.Val(), err)
+		key := iter.Val()
+		// 保留 Bot 轮询跨实例领导锁，避免多实例同时启动时互相清锁导致双 getUpdates
+		if key == config.NotifyBotPollerLockKey {
+			continue
+		}
+		if err := db.Rdb.Del(ctx, key).Err(); err != nil {
+			syslog.Errorf("[Init] Redis 键删除失败 %s: %v", key, err)
 		}
 	}
 	if err := iter.Err(); err != nil {
-		log.Printf("[Init] Redis 模式清理失败 %s: %v", config.RedisProjectKeyPattern, err)
+		syslog.Errorf("[Init] Redis 模式清理失败 %s: %v", config.RedisProjectKeyPattern, err)
 	}
 
 	log.Printf("[Init] Redis 前缀 %s 相关键已清空", config.RedisKeyPrefix)
@@ -99,9 +109,12 @@ func (s *InitService) TableInit() {
 		&model.MappingRule{},
 		&model.CategoryMapping{},
 		&model.SourceCategory{},
+		&model.NotifyConfigRecord{},
+		&model.NotifyChangeBatch{},
+		&model.NotifyChangeMid{},
 	)
 	if err != nil {
-		log.Println("Database AutoMigrate Failed:", err)
+		syslog.Errorf("Database AutoMigrate Failed: %v", err)
 		return
 	}
 	ensureMappingRuleIndexes()
@@ -111,44 +124,35 @@ func (s *InitService) TableInit() {
 
 func ensureMappingRuleIndexes() {
 	if err := repository.EnsureMappingRuleIndexes(); err != nil {
-		log.Println("Ensure mapping rule indexes failed:", err)
+		syslog.Errorf("Ensure mapping rule indexes failed: %v", err)
 	}
 }
 
-func (s *InitService) BasicConfigInit() {
-	if repository.ExistSiteConfig() {
+// SiteWebConfigInit 初始化网站基本信息（首页轮播已移入内容管理，不再由初始化维护）
+func (s *InitService) SiteWebConfigInit() {
+	// 首次：写入默认基本信息
+	if !repository.ExistSiteConfig() {
+		if err := repository.SaveSiteBasic(defaultBasicConfig()); err != nil {
+			syslog.Errorf("SiteWebConfigInit SaveSiteBasic Error: %v", err)
+		}
 		return
 	}
-	bc := defaultBasicConfig()
-	_ = repository.SaveSiteBasic(bc) // SaveSiteBasic 内部应处理 FirstOrCreate 逻辑
+	// 已初始化：回填网站配置的 Redis 缓存
+	_ = repository.GetSiteBasic()
 }
 
+// defaultBasicConfig 默认网站基本信息
 func defaultBasicConfig() model.BasicConfig {
 	return model.BasicConfig{
 		SiteName: "EcoHub",
+		// 网站访问地址：Logo 跳转与 Telegram 播放链接；初始为空需在后台配置
+		SiteURL: "",
 		// 初始为空：前端未配置时用本地 /logo.png；后台配置后按配置原样加载
 		Logo:     "",
 		Keyword:  "在线视频, 免费观影",
 		Describe: "自动采集, 多播放源集成,在线观影网站",
 		State:    true,
 		Hint:     "网站升级中, 暂时无法访问 !!!",
-	}
-}
-
-func (s *InitService) BannersInit() {
-	if repository.ExistBannersConfig() {
-		return
-	}
-	bl := defaultBanners()
-	_ = repository.SaveBanners(bl)
-}
-
-func defaultBanners() model.Banners {
-	return model.Banners{
-		model.Banner{Id: utils.GenerateSalt(), Name: "樱花庄的宠物女孩", Year: 2020, CName: "日韩动漫", Poster: "https://s2.loli.net/2024/02/21/Wt1QDhabdEI7HcL.jpg", Picture: "https://s2.loli.net/2024/02/21/Wt1QDhabdEI7HcL.jpg", PictureSlide: "https://img.bfzypic.com/upload/vod/20230424-43/06e79232a4650aea00f7476356a49847.jpg", Remark: "已完结"},
-		model.Banner{Id: utils.GenerateSalt(), Name: "从零开始的异世界生活", Year: 2020, CName: "日韩动漫", Poster: "https://s2.loli.net/2024/02/21/UkpdhIRO12fsy6C.jpg", Picture: "https://s2.loli.net/2024/02/21/UkpdhIRO12fsy6C.jpg", PictureSlide: "https://img.bfzypic.com/upload/vod/20230424-43/06e79232a4650aea00f7476356a49847.jpg", Remark: "已完结"},
-		model.Banner{Id: utils.GenerateSalt(), Name: "五等分的花嫁", Year: 2020, CName: "日韩动漫", Poster: "https://s2.loli.net/2024/02/21/wXJr59Zuv4tcKNp.jpg", Picture: "https://s2.loli.net/2024/02/21/wXJr59Zuv4tcKNp.jpg", PictureSlide: "https://img.bfzypic.com/upload/vod/20230424-43/06e79232a4650aea00f7476356a49847.jpg", Remark: "已完结"},
-		model.Banner{Id: utils.GenerateSalt(), Name: "我的青春恋爱物语果然有问题", Year: 2020, CName: "日韩动漫", Poster: "https://s2.loli.net/2024/02/21/oMAGzSliK2YbhRu.jpg", Picture: "https://s2.loli.net/2024/02/21/oMAGzSliK2YbhRu.jpg", PictureSlide: "https://img.bfzypic.com/upload/vod/20230424-43/06e79232a4650aea00f7476356a49847.jpg", Remark: "已完结"},
 	}
 }
 
@@ -167,27 +171,22 @@ func (s *InitService) FilmSourceInit() {
 		return
 	}
 	if err := repository.BatchAddCollectSource(defaultFilmSources()); err != nil {
-		log.Println("BatchAddCollectSource Error: ", err)
+		syslog.Errorf("BatchAddCollectSource Error: %v", err)
 	}
 }
 
 func defaultFilmSources() []model.FilmSource {
 	// 使用 URI 哈希作为 ID，确保重置后顺序一致且支持主从切换。
 	return []model.FilmSource{
-		{Name: "HD(SN)", Uri: `https://suoniapi.com/api.php/provide/vod/from/snm3u8/`, Grade: model.SlaveCollect, SyncPictures: false, State: false, Interval: config.DefaultSpiderInterval},
-		{Name: "HD(OK)", Uri: `https://okzyapi.com/api.php/provide/vod/`, Grade: model.SlaveCollect, SyncPictures: false, State: false, Interval: config.DefaultSpiderInterval},
-		{Name: "光速(GS)", Uri: `https://api.guangsuapi.com/api.php/provide/vod/json`, Grade: model.SlaveCollect, SyncPictures: false, State: false, Interval: config.DefaultSpiderInterval},
-		{Name: "HD(HM)", Uri: `https://json.heimuer.xyz/api.php/provide/vod/`, Grade: model.SlaveCollect, SyncPictures: false, State: false, Interval: config.DefaultSpiderInterval},
-		{Name: "魔都(MD)", Uri: `https://www.mdzyapi.com/api.php/provide/vod/`, Grade: model.SlaveCollect, SyncPictures: false, State: false, Interval: config.DefaultSpiderInterval},
-		{Name: "HD(DB)", Uri: `https://caiji.dbzy.tv/api.php/provide/vod/from/dbm3u8/at/json/`, Grade: model.SlaveCollect, SyncPictures: false, State: false, Interval: config.DefaultSpiderInterval},
-		{Name: "红牛(HN)", Uri: `https://www.hongniuzy2.com/api.php/provide/vod/at/json`, Grade: model.SlaveCollect, SyncPictures: false, State: false, Interval: config.DefaultSpiderInterval},
-		{Name: "HD(FF)", Uri: `http://cj.ffzyapi.com/api.php/provide/vod/`, Grade: model.MasterCollect, SyncPictures: false, State: true, Interval: config.DefaultSpiderInterval},
-		{Name: "HD(LY)", Uri: `https://360zy.com/api.php/provide/vod/at/json`, Grade: model.SlaveCollect, SyncPictures: false, State: false, Interval: config.DefaultSpiderInterval},
-		{Name: "HD(IK)", Uri: `https://ikunzyapi.com/api.php/provide/vod/at/json`, Grade: model.SlaveCollect, SyncPictures: false, State: false, Interval: config.DefaultSpiderInterval},
-		{Name: "HD(LZ)", Uri: `https://cj.lziapi.com/api.php/provide/vod/`, Grade: model.SlaveCollect, SyncPictures: false, State: false, Interval: config.DefaultSpiderInterval},
-		{Name: "樱花(YH)", Uri: `https://m3u8.apiyhzy.com/api.php/provide/vod/`, Grade: model.SlaveCollect, SyncPictures: false, State: false, Interval: config.DefaultSpiderInterval},
-		{Name: "HD(BF)", Uri: `https://bfzyapi.com/api.php/provide/vod/`, Grade: model.SlaveCollect, SyncPictures: false, State: false, Interval: config.DefaultSpiderInterval},
-		{Name: "卧龙(WL)", Uri: `https://collect.wolongzy.cc/api.php/provide/vod/`, Grade: model.SlaveCollect, SyncPictures: false, State: false, Interval: config.DefaultSpiderInterval},
+		{Name: "魔都(MD)", Uri: `https://www.mdzyapi.com/api.php/provide/vod/`, Grade: model.MasterCollect, State: true, Interval: config.DefaultSpiderInterval},
+		{Name: "HD(SN)", Uri: `https://suoniapi.com/api.php/provide/vod/from/snm3u8/`, Grade: model.SlaveCollect, State: true, Interval: config.DefaultSpiderInterval},
+		{Name: "红牛(HN)", Uri: `https://www.hongniuzy2.com/api.php/provide/vod/at/json`, Grade: model.SlaveCollect, State: true, Interval: config.DefaultSpiderInterval},
+		{Name: "HD(FF)", Uri: `http://cj.ffzyapi.com/api.php/provide/vod/`, Grade: model.SlaveCollect, State: true, Interval: config.DefaultSpiderInterval},
+		{Name: "HD(LY)", Uri: `https://360zy.com/api.php/provide/vod/at/json`, Grade: model.SlaveCollect, State: true, Interval: config.DefaultSpiderInterval},
+		{Name: "HD(IK)", Uri: `https://ikunzyapi.com/api.php/provide/vod/at/json`, Grade: model.SlaveCollect, State: true, Interval: config.DefaultSpiderInterval},
+		{Name: "光速(GS)", Uri: `https://api.guangsuapi.com/api.php/provide/vod/json`, Grade: model.SlaveCollect, State: true, Interval: config.DefaultSpiderInterval},
+		{Name: "樱花(YH)", Uri: `https://m3u8.apiyhzy.com/api.php/provide/vod/`, Grade: model.SlaveCollect, State: true, Interval: config.DefaultSpiderInterval},
+		{Name: "HD(BF)", Uri: `https://bfzyapi.com/api.php/provide/vod/`, Grade: model.SlaveCollect, State: true, Interval: config.DefaultSpiderInterval},
 	}
 }
 
@@ -209,7 +208,7 @@ func (s *InitService) CollectCrontabInit() {
 func (s *InitService) registerTask(task model.FilmCollectTask) {
 	if !task.State {
 		if err := repository.UpdateFilmTask(task); err != nil {
-			log.Println("UpdateFilmTask Error: ", err)
+			syslog.Errorf("UpdateFilmTask Error: %v", err)
 		}
 		return
 	}
@@ -230,36 +229,9 @@ func (s *InitService) registerTask(task model.FilmCollectTask) {
 		task.Cid = cid
 		spider.RegisterTaskCid(task.Id, task.Cid)
 		if err := repository.UpdateFilmTask(task); err != nil {
-			log.Println("UpdateFilmTask Error: ", err)
+			syslog.Errorf("UpdateFilmTask Error: %v", err)
 		}
 	}
-}
-
-func registerRuntimeTask(task model.FilmCollectTask) error {
-	if !task.State {
-		return repository.UpdateFilmTask(task)
-	}
-
-	var cid cron.EntryID
-	var err error
-	switch task.Model {
-	case 0:
-		cid, err = spider.AddAutoUpdateCron(task.Id, task.Spec)
-	case 1:
-		cid, err = spider.AddFilmUpdateCron(task.Id, task.Spec)
-	case 2:
-		cid, err = spider.AddFilmRecoverCron(task.Id, task.Spec)
-	case 3:
-		cid, err = spider.AddOrphanCleanCron(task.Id, task.Spec)
-	default:
-		return fmt.Errorf("不支持的定时任务类型: %d", task.Model)
-	}
-	if err != nil {
-		return err
-	}
-	task.Cid = cid
-	spider.RegisterTaskCid(task.Id, task.Cid)
-	return repository.UpdateFilmTask(task)
 }
 
 func (s *InitService) createDefaultTasks() {

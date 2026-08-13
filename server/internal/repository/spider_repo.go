@@ -172,7 +172,29 @@ func GetCollectSourceList() []model.FilmSource {
 		log.Println("GetCollectSourceList Error:", err)
 		return nil
 	}
+	for i := range list {
+		normalizeCollectCd(&list[i])
+	}
 	return list
+}
+
+// ReplaceCollectSources 用备份列表整体替换采集站（事务清空后写入）
+func ReplaceCollectSources(list []model.FilmSource) error {
+	return db.Mdb.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&model.FilmSource{}).Error; err != nil {
+			return err
+		}
+		if len(list) == 0 {
+			return nil
+		}
+		for i := range list {
+			if list[i].Id == "" && list[i].Uri != "" {
+				list[i].Id = utils.GenerateHashKey(list[i].Uri)
+			}
+			normalizeCollectSourceDefaults(&list[i])
+		}
+		return tx.Create(&list).Error
+	})
 }
 
 // GetCollectSourceListByGrade 返回指定类型的采集 Api 信息 Master | Slave
@@ -182,7 +204,29 @@ func GetCollectSourceListByGrade(grade model.SourceGrade) []model.FilmSource {
 		log.Println("GetCollectSourceListByGrade Error:", err)
 		return nil
 	}
+	for i := range list {
+		normalizeCollectCd(&list[i])
+	}
 	return list
+}
+
+// PickMasterSourceForCategory 选取用于分类树同步的主站。
+// 规则：分类树只能来自主站；优先已启用主站；无启用时用任意主站（含未启用）；
+// 没有任何主站时返回 nil（没有主站就不能有分类树）。
+func PickMasterSourceForCategory() *model.FilmSource {
+	masters := GetCollectSourceListByGrade(model.MasterCollect)
+	if len(masters) == 0 {
+		return nil
+	}
+	for i := range masters {
+		if masters[i].State {
+			m := masters[i]
+			return &m
+		}
+	}
+	// 未启用的主站仍可作为分类树唯一来源
+	m := masters[0]
+	return &m
 }
 
 // GetEnabledCollectSourceList 获取已启用采集站列表。
@@ -191,6 +235,9 @@ func GetEnabledCollectSourceList() []model.FilmSource {
 	if err := db.Mdb.Where("state = ?", true).Order("grade ASC").Find(&list).Error; err != nil {
 		log.Println("GetEnabledCollectSourceList Error:", err)
 		return nil
+	}
+	for i := range list {
+		normalizeCollectCd(&list[i])
 	}
 	return list
 }
@@ -264,6 +311,7 @@ func FindCollectSourceById(id string) *model.FilmSource {
 	if err := db.Mdb.Where("id = ?", id).First(&fs).Error; err != nil {
 		return nil
 	}
+	normalizeCollectCd(&fs)
 	return &fs
 }
 
@@ -379,6 +427,14 @@ func ResetCollectSources(list []model.FilmSource) error {
 func normalizeCollectSourceDefaults(source *model.FilmSource) {
 	if source.Interval <= 0 {
 		source.Interval = config.DefaultSpiderInterval
+	}
+	normalizeCollectCd(source)
+}
+
+// normalizeCollectCd 读取路径兜底：历史数据 cd 列可能为 0，统一按默认 24 小时处理。
+func normalizeCollectCd(source *model.FilmSource) {
+	if source.Cd <= 0 {
+		source.Cd = 24
 	}
 }
 

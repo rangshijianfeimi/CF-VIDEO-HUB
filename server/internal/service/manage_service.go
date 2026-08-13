@@ -29,7 +29,7 @@ func (s *ManageService) UpdateSiteBasic(c model.BasicConfig) error {
 	return repository.SaveSiteBasic(c)
 }
 
-// ResetSiteBasic 重置网站配置信息
+// ResetSiteBasic 重置网站基本信息为默认值（首页轮播已移入内容管理，重置不再触碰轮播）
 func (s *ManageService) ResetSiteBasic() error {
 	return repository.SaveSiteBasic(defaultBasicConfig())
 }

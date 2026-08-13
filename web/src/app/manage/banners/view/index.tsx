@@ -27,10 +27,19 @@ import {
   DeleteOutlined,
   PlusCircleOutlined,
   UploadOutlined,
+  PictureOutlined,
 } from "@ant-design/icons";
+
 import { ApiGet, ApiPost } from "@/lib/client-api";
 import { useAppMessage } from "@/lib/useAppMessage";
+import { useManagePermission } from "@/lib/manage-permission";
+import { FALLBACK_IMG } from "@/lib/fallbackImg";
 import ManagePageHeader from "@/app/manage/components/page-header";
+import ImagePicker from "@/app/manage/components/image-picker";
+import {
+  IMAGE_UPLOAD_ACCEPT,
+  isAllowedImageFile,
+} from "@/lib/imageUpload";
 import styles from "./index.module.less";
 
 const { Title, Text } = Typography;
@@ -110,6 +119,7 @@ export default function BannersPageView() {
   const [banners, setBanners] = useState<BannerRecord[]>([]);
   const [loading, setLoading] = useState(false);
   const { message } = useAppMessage();
+  const { canWrite } = useManagePermission();
 
   const [editorVisible, setEditorVisible] = useState(false);
   const [editorMode, setEditorMode] = useState<EditorMode>("create");
@@ -121,6 +131,7 @@ export default function BannersPageView() {
   const [selectedFilm, setSelectedFilm] = useState<FilmOption | null>(null);
 
   const [currentRow, setCurrentRow] = useState<BannerRecord | null>(null);
+  const [pickerOpen, setPickerOpen] = useState(false);
   const watchedName = Form.useWatch("name", form);
   const watchedCName = Form.useWatch("cName", form);
   const watchedYear = Form.useWatch("year", form);
@@ -142,7 +153,7 @@ export default function BannersPageView() {
   }, [message]);
 
   useEffect(() => {
-    fetchBanners();
+    void fetchBanners();
   }, [fetchBanners]);
 
   const handleDelete = async (id: string) => {
@@ -272,6 +283,11 @@ export default function BannersPageView() {
     fieldName: UploadFieldName,
   ) => {
     const { file, onSuccess, onError } = options;
+    if (!isAllowedImageFile(file)) {
+      message.error("仅支持上传 JPG/JPEG/PNG/WebP/ICO 格式的图片");
+      onError?.(new Error("unsupported image type"));
+      return;
+    }
     const formData = new FormData();
     formData.append("file", file);
     try {
@@ -285,7 +301,7 @@ export default function BannersPageView() {
         onError?.(new Error(resp.msg));
       }
     } catch (err) {
-      message.error("上传失败");
+      // 拦截器已统一提示，避免重复弹窗
       onError?.(err);
     }
   };
@@ -345,9 +361,18 @@ export default function BannersPageView() {
       title: "影片封面",
       dataIndex: "picture",
       key: "picture",
-      align: "left" as const,
+      align: "center" as const,
       render: (src: string) => (
-        <AntImage src={src} height={50} style={{ objectFit: "cover" }} />
+        <div style={{ display: "flex", justifyContent: "center" }}>
+          <AntImage 
+            src={src || FALLBACK_IMG} 
+            width={48}
+            height={64} 
+            style={{ objectFit: "cover", background: "var(--public-surface-3)", borderRadius: 4 }} 
+            fallback={FALLBACK_IMG}
+            placeholder={<div style={{ width: '100%', height: '100%', background: 'var(--public-surface-3)', borderRadius: 4 }} />}
+          />
+        </div>
       ),
     },
     {
@@ -380,6 +405,7 @@ export default function BannersPageView() {
               size="small"
               style={{ background: "#1890ff", borderColor: "#1890ff" }}
               icon={<EditOutlined />}
+              disabled={!canWrite}
               onClick={() => openEditEditor(record)}
             />
           </Tooltip>
@@ -394,6 +420,7 @@ export default function BannersPageView() {
                 shape="circle"
                 size="small"
                 icon={<DeleteOutlined />}
+                disabled={!canWrite}
               />
             </Tooltip>
           </Popconfirm>
@@ -420,10 +447,12 @@ export default function BannersPageView() {
           <Flex gap={16} align="flex-start">
             <div style={{ flexShrink: 0 }}>
               <AntImage
-                src={previewPicture}
+                src={previewPicture || FALLBACK_IMG}
                 width={96}
                 height={132}
-                style={{ objectFit: "cover", borderRadius: 8 }}
+                style={{ objectFit: "cover", borderRadius: 8, background: "var(--public-surface-3)" }}
+                fallback={FALLBACK_IMG}
+                placeholder={<div style={{ width: '100%', height: '100%', background: 'var(--public-surface-3)', borderRadius: 8 }} />}
               />
             </div>
             <Space
@@ -521,21 +550,30 @@ export default function BannersPageView() {
           </Form.Item>
           <Upload
             showUploadList={false}
+            accept={IMAGE_UPLOAD_ACCEPT}
             customRequest={(o) => handleCustomUpload(o, "picture")}
           >
             <Button icon={<UploadOutlined />} style={{ marginLeft: 8 }}>
               上传
             </Button>
           </Upload>
+          <Button
+            icon={<PictureOutlined />}
+            onClick={() => setPickerOpen(true)}
+          >
+            选图
+          </Button>
         </Space.Compact>
       </Form.Item>
       {previewPicture && (
         <Card size="small" title="影片封面预览" style={{ borderRadius: 12 }}>
           <AntImage
-            src={previewPicture}
+            src={previewPicture || FALLBACK_IMG}
             width={160}
             height={220}
-            style={{ objectFit: "cover", borderRadius: 8 }}
+            style={{ objectFit: "cover", borderRadius: 8, background: "var(--public-surface-3)" }}
+            fallback={FALLBACK_IMG}
+            placeholder={<div style={{ width: '100%', height: '100%', background: 'var(--public-surface-3)', borderRadius: 8 }} />}
           />
         </Card>
       )}
@@ -545,11 +583,12 @@ export default function BannersPageView() {
   return (
     <div className={styles.pageStack}>
       <ManagePageHeader
-        title="首页封面"
-        description="维护首页和推荐位所用的封面内容，统一管理排序、封面图与影片绑定信息。"
+        title="首页轮播"
+        description="维护首页和推荐位所用的轮播内容，统一管理排序、轮播图与影片绑定信息。"
       />
 
       <Table
+        bordered
         dataSource={banners}
         columns={columns}
         rowKey="id"
@@ -559,22 +598,24 @@ export default function BannersPageView() {
         scroll={{ x: "max-content" }}
         title={() => (
           <div className={styles.tableHeader}>
-            <div className={styles.tableTitle}>封面列表</div>
-            <Space size={[8, 8]} wrap className={styles.tableActions}>
+            <div className={styles.tableTitle}>轮播列表</div>
+            <div className={styles.tableActions}>
               <Button
                 type="primary"
                 icon={<PlusCircleOutlined />}
                 onClick={openCreateEditor}
               >
-                添加封面
+                添加轮播
               </Button>
-            </Space>
+            </div>
           </div>
         )}
       />
 
+
+
       <Modal
-        title={editorMode === "create" ? "添加封面" : "修改封面信息"}
+        title={editorMode === "create" ? "添加轮播" : "修改轮播信息"}
         open={editorVisible}
         onOk={handleSubmit}
         onCancel={closeEditor}
@@ -587,6 +628,15 @@ export default function BannersPageView() {
           {formItems}
         </Form>
       </Modal>
+
+      <ImagePicker
+        open={pickerOpen}
+        onCancel={() => setPickerOpen(false)}
+        onSelect={(link) => {
+          form.setFieldValue("picture", link);
+          setPickerOpen(false);
+        }}
+      />
     </div>
   );
 }

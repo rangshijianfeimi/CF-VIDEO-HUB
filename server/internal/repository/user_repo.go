@@ -1,7 +1,6 @@
 package repository
 
 import (
-	"fmt"
 	"log"
 	"server/internal/config"
 	"server/internal/infra/db"
@@ -21,15 +20,6 @@ func ExistUserTable() bool {
 func InitBuiltinAccounts() {
 	ensureBuiltinUser(config.DefaultAdminUser, config.DefaultAdminPass, "administrator@gmail.com", "Spark", model.UserRoleAdmin)
 	ensureBuiltinUser(config.DefaultVisitorUser, config.DefaultVisitorPass, "guest@example.com", "访客", model.UserRoleVisitor)
-}
-
-func ResetBuiltinAccounts() error {
-	if err := db.Mdb.Exec(fmt.Sprintf("TRUNCATE table %s", model.TableUser)).Error; err != nil {
-		return err
-	}
-	db.Mdb.Exec(fmt.Sprintf("alter table %s auto_Increment = %d", model.TableUser, config.UserIdInitialVal))
-	InitBuiltinAccounts()
-	return nil
 }
 
 func ensureBuiltinUser(userName, password, email, nickName string, role int) {
@@ -102,11 +92,17 @@ func UpdateUserInfo(u model.User) {
 }
 
 // GetUserPage 分页获取用户信息
-func GetUserPage(page *dto.Page, userName string) []model.User {
+func GetUserPage(page *dto.Page, userName string, role, status int) []model.User {
 	var list []model.User
 	query := db.Mdb.Model(&model.User{})
 	if userName != "" {
 		query = query.Where("user_name LIKE ?", "%"+userName+"%")
+	}
+	if role >= 0 {
+		query = query.Where("role = ?", role)
+	}
+	if status >= 0 {
+		query = query.Where("status = ?", status)
 	}
 	dto.GetPage(query, page)
 	query.Order("id DESC").Offset((page.Current - 1) * page.PageSize).Limit(page.PageSize).Find(&list)
