@@ -1,107 +1,92 @@
+<div align="center">
+
+<img src="logo.png" alt="EcoHub" width="120" />
+
 # EcoHub
 
-EcoHub 是一个多源影视聚合系统。服务定时采集、归并、缓存、鉴权和开放接口；并包含前台站点及管理后台。
+[![Release](https://img.shields.io/github/v/release/fe-spark/EcoHub)](https://github.com/fe-spark/EcoHub/releases)
+[![Go](https://img.shields.io/badge/Go-1.24-00ADD8?logo=go&logoColor=white)](https://go.dev/)
+[![Next.js](https://img.shields.io/badge/Next.js-16-black?logo=nextdotjs&logoColor=white)](https://nextjs.org/)
+[![MySQL](https://img.shields.io/badge/MySQL-8-4479A1?logo=mysql&logoColor=white)](https://www.mysql.com/)
+[![Redis](https://img.shields.io/badge/Redis-7-DC382D?logo=redis&logoColor=white)](https://redis.io/)
+[![License](https://img.shields.io/github/license/fe-spark/EcoHub)](./LICENSE)
 
-项目仅用于学习和技术交流，不提供影视资源存储。如果觉得项目不错，欢迎点个 ⭐ Star 支持一下。
+**自托管影视聚合系统**
 
-## 推荐服务器
+中文 | [English](./docs/README_EN.md)
 
-- [CloudCone](https://app.cloudcone.com/?ref=14393) — 演示站用的就是这家的服务器，**不限制 IO**（不少便宜 VPS 会卡 IO，跑数据库和采集容易卡死）。海外机器最大的好处就是**免备案、拿到就能用**，部署爬虫、做这种站很顺手，顺便还能搭个自己用的代理。注册与购买可使用邀请链接支持此项目。
+[在线演示](https://eco.fe-spark.cn) · [管理后台](https://eco.fe-spark.cn/manage) · [部署指南](./docs/README-Deploy.md) · [常见问题](./docs/README-FAQ.md)
 
-## 推荐机场（科学上网）
+</div>
 
-部署海外服务器、采集源、调试接口时，稳定的代理几乎是刚需。这里推荐目前性价比极高的直连机场 **良心云**：
+> **使用须知**  
+> EcoHub 不提供、不存储任何影视文件。片源来自使用者自行配置的采集接口。请遵守所在地区的法律法规以及各源站的使用约定，由此产生的风险由使用者自行承担。本项目仅供学习与技术交流。
 
-- **2 元 / 月 100G**，6 元直接 1000G（1T），真正的价格屠夫
-- 全直连 AWS + 甲骨文高配机器，VLESS Reality + Hysteria2 双协议
-- 全节点解锁 Netflix / Disney+ / TikTok / ChatGPT，无审计、1 倍流量
-- 支持新疆、河南、福建等特殊地区，晚高峰也能看 4K
-- 新用户注册即送体验流量
+## 简介
 
-👉 专属优惠注册链接（支持本项目）：[注册良心云](https://xn--9kqz23b19z.com/#/register?code=xAmvfdic)
+EcoHub 是一款高性能、现代化的全栈多源影视聚合系统。它不仅提供极致流畅的 Web 观影体验，还集成了强大的自动化采集与管理后台，旨在帮助开发者和影视爱好者快速搭建属于自己的私人影视库。
 
-> 个人实测稳定，适合当主力备用梯 + 大流量下载，可每月购买防跑路
+## 在线演示
 
-## 演示入口
-
-- 演示站点：[https://eco.fe-spark.cn](https://eco.fe-spark.cn)
-- 管理后台：[https://eco.fe-spark.cn/manage](https://eco.fe-spark.cn/manage)
-- 演示访客账号/密码：`guest / guest`
-
-## 当前版本
-
-正式版 **v2.0+** 发布形态为 **All-in-One 单镜像** `ghcr.io/fe-spark/ecohub`（同容器托管 Web + API）。变更记录见 [RELEASE.md](./RELEASE.md)。
-
-## 项目定位
-
-EcoHub 的核心不是把多个资源站简单平铺入库，而是以“单主站 + 多附属站”的方式归并内容：
-
-- 主站负责影片主数据、检索索引、分类和详情骨架。
-- 附属站负责补充播放源，并挂载到主站影片下。
-- **主站身份键**（`film_index.content_key`）：优先 `vod_{源站vod_id}`，无 ID 时回退 `name_{hash}`。
-- **跨站匹配**（`movie_match_key`）：优先豆瓣身份，其次规范化片名，用于附属站播放源对齐。
-- 前台、后台、TVBox / MacCMS 接口共用一致的分类、筛选和排序语义。
-- 采集任务完成并发布快照后，入库影片会在前台页面、后台列表和开放接口中可见。
-- 后台支持单片更新全部站点，便于补齐多来源播放列表。
-
-## 系统总览
-
-```mermaid
-flowchart LR
-    User["用户 / 管理员"] --> Web["Next.js Web"]
-    TV["TVBox / MacCMS 客户端"] --> Web
-    Web --> API["Go API Server"]
-    API --> MySQL["MySQL"]
-    API --> Redis["Redis"]
-    API --> Spider["Spider 采集引擎"]
-    Spider --> Master["主站"]
-    Spider --> Slave["附属站"]
-```
-
-## 核心数据流
-
-```mermaid
-flowchart TD
-    Source["采集源配置"] --> Spider["Spider 采集"]
-    Spider --> Level{"站点等级"}
-    Level -->|主站| MasterData["写入影片主数据"]
-    Level -->|附属站| Playlist["写入播放列表"]
-    MasterData --> Snapshot["发布列表快照与筛选索引"]
-    Playlist --> Aggregate["详情页聚合多播放源"]
-    Snapshot --> API["前台 / 后台 / Provide 接口"]
-    Aggregate --> API
-```
-
-## 仓库结构
-
-```text
-.
-├── server/              # Go API 服务、采集、数据归并、缓存和鉴权
-├── web/                 # Next.js 前端、登录页和管理后台
-├── deploy/release/      # 发布版 Docker Compose 配置
-├── scripts/             # 发布版安装脚本
-├── docker-compose.yml   # 源码版 Web / API / MySQL / Redis 容器编排
-├── README-Deploy.md     # 部署指南（安装脚本 / 1Panel / 源码版）
-├── README-FAQ.md        # FAQ 与排障
-├── server/README.md     # 服务端开发说明
-└── web/README.md        # 前端开发说明
-```
-
-
-## 技术栈
-
-| 模块 | 技术 |
+| 入口 | 地址 |
 | --- | --- |
-| Server | Go 1.24、Gin、GORM、MySQL 8、Redis 7、cron、Colly |
-| Web | Next.js 16、React 19、TypeScript、Ant Design 6、Axios、Artplayer、Hls.js |
-| Deploy | Docker、Docker Compose |
+| 前台 | [https://eco.fe-spark.cn](https://eco.fe-spark.cn) |
+| 管理后台 | [https://eco.fe-spark.cn/manage](https://eco.fe-spark.cn/manage) |
 
-## 快速启动
+只读演示账号：`guest` / `guest`。该账号不可保存配置，正式部署请使用自有账号并修改默认密码。
 
-### 本地开发
+## 推荐
 
-1. 准备 MySQL 和 Redis。
-2. 启动后端：
+### 服务器
+
+[CloudCone](https://app.cloudcone.com/?ref=14393) 为演示站点所使用的服务商，磁盘 **I/O 不受限**。部分低价 VPS 对 I/O 设有限制，数据库与采集任务容易因此阻塞。境外主机无需 ICP 备案，开通即可使用，适用于采集任务与本类站点部署，亦可用于自建网络出口。
+
+### 代理服务
+
+部署境外主机、访问采集源或调试接口时，通常需要稳定的网络代理。建议使用直连服务 **良心云**：
+
+- **2 元 / 月 100G**，6 元 1000G（1T）
+- 直连 AWS 与 Oracle，协议为 VLESS Reality 与 Hysteria2
+- 可解锁 Netflix、Disney+、TikTok、ChatGPT；无审计，流量倍率 1 倍
+- 覆盖新疆、河南、福建等地区，高峰时段可播放 4K
+- 新用户注册即获体验流量
+
+[注册良心云](https://xn--9kqz23b19z.com/#/register?code=xAmvfdic)
+
+## 快速开始
+
+要求 Docker 20+、Compose 2+，建议配置不低于 2 核 2 GB 内存。
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/fe-spark/EcoHub/main/scripts/install-release.sh | sh
+cd ~/ecohub
+```
+
+编辑 `.env`：将 `openssl rand -hex 32` 的输出写入 `JWT_SECRET`，并修改 MySQL / Redis 密码，然后启动：
+
+```bash
+docker compose up -d
+```
+
+| 地址 | 说明 |
+| --- | --- |
+| `http://<主机>:3000` | 前台 |
+| `http://<主机>:3000/manage` | 管理后台 |
+| `http://<主机>:3000/api/provide/config` | TVBox / 影视仓 订阅地址 |
+| `http://<主机>:3000/api/provide/vod` | MacCMS 兼容接口 |
+| `http://<主机>:18080/api/*` | API 直连（请勿对公网开放） |
+
+默认账号：`admin` / `admin`（读写）、`guest` / `guest`（只读）。对外部署前须立即修改默认密码。
+
+安装完成后前台无数据，属预期行为。须在管理后台 **采集中心** 完成全量采集并发布后，前台才会展示影片。1Panel、外部数据库与反向代理见 [部署指南](./docs/README-Deploy.md)。
+
+Telegram 通知在管理后台 **系统设置 → 通知配置** 中填写。境内服务器访问 Telegram 时经常出现超时，可在 `.env` 中设置 `TG_PROXY=http://host.docker.internal:7890`。详见 [server/notify.md](./server/notify.md)。
+
+## 本地开发
+
+请先在本地启动 MySQL 8 与 Redis 7。后端与前端需两个终端，均从仓库根目录执行。
+
+API：
 
 ```bash
 cd server
@@ -109,7 +94,7 @@ cp .env.example .env
 go run ./cmd/server
 ```
 
-3. 启动前端：
+Web：
 
 ```bash
 cd web
@@ -118,53 +103,28 @@ npm install
 npm run dev
 ```
 
-4. 默认访问：
+前台 `http://127.0.0.1:3000`，后台 `/manage`，API `http://127.0.0.1:8080`。[服务端](./server/README.md) · [前端](./web/README.md)
 
-- 前台：`http://127.0.0.1:3000`
-- 后台：`http://127.0.0.1:3000/manage`
-- 后端：`http://127.0.0.1:8080`
-
-详细环境变量和运行说明见：
-
-- [服务端说明](./server/README.md)
-- [前端说明](./web/README.md)
-
-### Docker 部署（推荐）
-
-发布版一键安装（拉取 `ghcr.io/fe-spark/ecohub:latest` + 内置 MySQL/Redis）：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/fe-spark/EcoHub/main/scripts/install-release.sh | sh
-cd ~/ecohub && docker compose up -d
-```
-
-部署见 [部署指南](./README-Deploy.md)（安装脚本、1Panel、源码版）；版本说明见 [RELEASE.md](./RELEASE.md)。
-
-## 文档导航
+## 文档
 
 | 文档 | 内容 |
 | --- | --- |
-| [server/README.md](./server/README.md) | 服务端启动、环境变量、采集模型、接口分组、鉴权模型 |
-| [web/README.md](./web/README.md) | 前端启动、API 转发、页面结构、鉴权边界 |
-| [README-Deploy.md](./README-Deploy.md) | 安装脚本 / 1Panel / 源码版 / 反代与排障 |
-| [RELEASE.md](./RELEASE.md) | 版本变更与镜像 tag |
-| [README-FAQ.md](./README-FAQ.md) | 主站机制、缓存、排序、登录态、Docker 常见问题 |
+| [部署指南](./docs/README-Deploy.md) | 安装脚本、1Panel、手动部署、反向代理与升级 |
+| [常见问题](./docs/README-FAQ.md) | 空站、采集、缓存、登录 |
+| [版本说明](./docs/RELEASE.md) | 变更记录、镜像 tag |
+| [服务端](./server/README.md) / [前端](./web/README.md) | 环境变量、接口、本地启动 |
+| [English](./docs/README_EN.md) | English overview |
 
-## 默认账号
+## Star History
 
-服务首次启动会补齐内置账号：
+<a href="https://star-history.dera.page/#fe-spark/EcoHub&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=fe-spark/EcoHub&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=fe-spark/EcoHub&type=Date" />
+    <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=fe-spark/EcoHub&type=Date" />
+  </picture>
+</a>
 
-| 类型 | 账号 | 密码 | 权限 |
-| --- | --- | --- | --- |
-| 管理员 | `admin` | `admin` | 可读可写 |
-| 访客 | `guest` | `guest` | 只读 |
+---
 
-默认账号只适合初始化和演示。对外部署后请立即修改密码，或替换为你自己的账号体系。
-
-## 开放接口
-
-- MacCMS 兼容查询：`/api/provide/vod`
-- TVBox / 影视仓配置：`/api/provide/config`
-- App API 基础地址：`/api`
-
-接口细节以服务端路由和 [服务端说明](./server/README.md) 为准。
+[MIT](./LICENSE) · [fe-spark/EcoHub](https://github.com/fe-spark/EcoHub) · [Issues](https://github.com/fe-spark/EcoHub/issues)
