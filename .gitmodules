@@ -1,3 +1,6 @@
-[submodule "harmony"]
-	path = harmony
-	url = https://github.com/fe-spark/EcoHarmony.git
+[submodule "app-for-ohos"]
+	path = app-for-ohos
+	url = https://github.com/fe-spark/app-for-ohos.git
+[submodule "app-for-android"]
+	path = app-for-android
+	url = https://github.com/fe-spark/app-for-android.git
