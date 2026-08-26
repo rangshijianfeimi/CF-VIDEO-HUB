@@ -3,6 +3,7 @@ package service
 import (
 	"fmt"
 	"log"
+	"strings"
 
 	"server/internal/config"
 	"server/internal/infra/db"
@@ -63,6 +64,9 @@ func (s *InitService) ensureFilmListSnapshot() {
 	if err := filmrepo.EnsureActiveFilmListSnapshot(); err != nil {
 		syslog.Errorf("[Init] 前台影片列表快照引导失败: %v", err)
 	}
+	if err := filmrepo.EnsureActiveFilterOptionSnapshot(); err != nil {
+		syslog.Errorf("[Init] 前台影片筛选标签快照引导失败: %v", err)
+	}
 }
 
 func (s *InitService) loadActiveFilmReadModel() {
@@ -76,6 +80,10 @@ func clearStartupCaches() {
 	iter := db.Rdb.Scan(ctx, 0, config.RedisProjectKeyPattern, config.MaxScanCount).Iterator()
 	for iter.Next(ctx) {
 		key := iter.Val()
+		// 保留管理员/用户登录凭证，避免重启导致在线用户掉线
+		if strings.HasPrefix(key, config.RedisKeyPrefix+":User:Token:") {
+			continue
+		}
 		// 保留 Bot 轮询跨实例领导锁，避免多实例同时启动时互相清锁导致双 getUpdates
 		if key == config.NotifyBotPollerLockKey {
 			continue
@@ -88,7 +96,7 @@ func clearStartupCaches() {
 		syslog.Errorf("[Init] Redis 模式清理失败 %s: %v", config.RedisProjectKeyPattern, err)
 	}
 
-	log.Printf("[Init] Redis 前缀 %s 相关键已清空", config.RedisKeyPrefix)
+	log.Printf("[Init] Redis 业务临时缓存已清理 (用户登录态已保留)")
 }
 
 func (s *InitService) TableInit() {
@@ -125,6 +133,7 @@ func (s *InitService) TableInit() {
 		return
 	}
 	ensureMappingRuleIndexes()
+	ensureSnapshotPerformanceIndexes()
 
 	db.Mdb.Exec(fmt.Sprintf("alter table %s auto_Increment = %d", model.TableUser, config.UserIdInitialVal))
 }
@@ -132,6 +141,25 @@ func (s *InitService) TableInit() {
 func ensureMappingRuleIndexes() {
 	if err := repository.EnsureMappingRuleIndexes(); err != nil {
 		syslog.Errorf("Ensure mapping rule indexes failed: %v", err)
+	}
+}
+
+func ensureSnapshotPerformanceIndexes() {
+	queries := []string{
+		"CREATE INDEX idx_snap_pid_update ON film_list_snapshot(snapshot_version, pid, update_stamp)",
+		"CREATE INDEX idx_snap_cid_update ON film_list_snapshot(snapshot_version, cid, update_stamp)",
+		"CREATE INDEX idx_snap_pid_hits ON film_list_snapshot(snapshot_version, pid, hits)",
+		"CREATE INDEX idx_snap_cid_hits ON film_list_snapshot(snapshot_version, cid, hits)",
+		"CREATE INDEX idx_snap_pid_year ON film_list_snapshot(snapshot_version, pid, year, update_stamp)",
+		"CREATE INDEX idx_notify_change_mid_created_mid ON notify_change_mid(created_at, mid)",
+	}
+	for _, sql := range queries {
+		if err := db.Mdb.Exec(sql).Error; err != nil {
+			msg := strings.ToLower(err.Error())
+			if !strings.Contains(msg, "duplicate key name") && !strings.Contains(msg, "already exists") {
+				syslog.Errorf("ensureSnapshotPerformanceIndexes failed: %v", err)
+			}
+		}
 	}
 }
 
@@ -161,6 +189,7 @@ func defaultBasicConfig() model.BasicConfig {
 		State:    true,
 		Hint:     "网站升级中, 暂时无法访问 !!!",
 		Tip:      model.DefaultTipConfig(),
+		Notice:   model.DefaultNoticeConfig(),
 	}
 }
 
@@ -186,15 +215,18 @@ func (s *InitService) FilmSourceInit() {
 func defaultFilmSources() []model.FilmSource {
 	// 使用 URI 哈希作为 ID，确保重置后顺序一致且支持主从切换。
 	return []model.FilmSource{
-		{Name: "魔都(MD)", Uri: `https://www.mdzyapi.com/api.php/provide/vod/`, Grade: model.MasterCollect, State: true, Interval: config.DefaultSpiderInterval},
-		{Name: "HD(SN)", Uri: `https://suoniapi.com/api.php/provide/vod/from/snm3u8/`, Grade: model.SlaveCollect, State: true, Interval: config.DefaultSpiderInterval},
-		{Name: "红牛(HN)", Uri: `https://www.hongniuzy2.com/api.php/provide/vod/at/json`, Grade: model.SlaveCollect, State: true, Interval: config.DefaultSpiderInterval},
-		{Name: "HD(FF)", Uri: `http://cj.ffzyapi.com/api.php/provide/vod/`, Grade: model.SlaveCollect, State: true, Interval: config.DefaultSpiderInterval},
-		{Name: "HD(LY)", Uri: `https://360zy.com/api.php/provide/vod/at/json`, Grade: model.SlaveCollect, State: true, Interval: config.DefaultSpiderInterval},
-		{Name: "HD(IK)", Uri: `https://ikunzyapi.com/api.php/provide/vod/at/json`, Grade: model.SlaveCollect, State: true, Interval: config.DefaultSpiderInterval},
-		{Name: "光速(GS)", Uri: `https://api.guangsuapi.com/api.php/provide/vod/json`, Grade: model.SlaveCollect, State: true, Interval: config.DefaultSpiderInterval},
-		{Name: "樱花(YH)", Uri: `https://m3u8.apiyhzy.com/api.php/provide/vod/`, Grade: model.SlaveCollect, State: true, Interval: config.DefaultSpiderInterval},
-		{Name: "HD(BF)", Uri: `https://bfzyapi.com/api.php/provide/vod/`, Grade: model.SlaveCollect, State: true, Interval: config.DefaultSpiderInterval},
+		{Id: "3706668934", Name: "金鹰1(JY)", Uri: `https://jinyingzy.com/api.php/provide/vod`, Grade: model.MasterCollect, State: true, Interval: 200, Cd: 24},
+		{Id: "1016684692", Name: "速博(SUBO)", Uri: `https://subocaiji.com/api.php/provide/vod`, Grade: model.SlaveCollect, State: true, Interval: 200, Cd: 24},
+		{Id: "1208629981", Name: "HD(SN)", Uri: `https://suoniapi.com/api.php/provide/vod/from/snm3u8/`, Grade: model.SlaveCollect, State: true, Interval: 200, Cd: 24},
+		{Id: "2608173413", Name: "金鹰2(JY)", Uri: `https://jyzyapi.com/api.php/provide/vod`, Grade: model.SlaveCollect, State: true, Interval: 200, Cd: 24},
+		{Id: "2761253814", Name: "红牛(HN)", Uri: `https://www.hongniuzy2.com/api.php/provide/vod/at/json`, Grade: model.SlaveCollect, State: true, Interval: 200, Cd: 24},
+		{Id: "2898990914", Name: "非凡(FF)", Uri: `http://cj.ffzyapi.com/api.php/provide/vod/`, Grade: model.SlaveCollect, State: true, Interval: 200, Cd: 24},
+		{Id: "3370810636", Name: "HD(LY)", Uri: `https://360zy.com/api.php/provide/vod/at/json`, Grade: model.SlaveCollect, State: true, Interval: 200, Cd: 24},
+		{Id: "3423682340", Name: "HD(IK)", Uri: `https://ikunzyapi.com/api.php/provide/vod/at/json`, Grade: model.SlaveCollect, State: true, Interval: 200, Cd: 24},
+		{Id: "4194624554", Name: "U酷(UKU)", Uri: `https://api.ukuapi88.com/api.php/provide/vod`, Grade: model.SlaveCollect, State: true, Interval: 200, Cd: 24},
+		{Id: "4247318859", Name: "光速(GS)", Uri: `https://api.guangsuapi.com/api.php/provide/vod/json`, Grade: model.SlaveCollect, State: true, Interval: 200, Cd: 24},
+		{Id: "531717376", Name: "樱花(YH)", Uri: `https://m3u8.apiyhzy.com/api.php/provide/vod/`, Grade: model.SlaveCollect, State: true, Interval: 200, Cd: 24},
+		{Id: "829678680", Name: "HD(BF)", Uri: `https://bfzyapi.com/api.php/provide/vod/`, Grade: model.SlaveCollect, State: true, Interval: 200, Cd: 24},
 	}
 }
 

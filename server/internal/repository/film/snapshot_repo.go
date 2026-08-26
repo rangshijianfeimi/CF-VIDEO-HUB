@@ -121,6 +121,9 @@ func ActivateRebuiltFilmListSnapshot(version string) error {
 	if err := RebuildFilmListSnapshot(version); err != nil {
 		return err
 	}
+	if err := RebuildFilterOptionSnapshot(version); err != nil {
+		log.Printf("RebuildFilterOptionSnapshot Error: %v", err)
+	}
 	if err := LoadActiveFilmReadModel(version); err != nil {
 		return err
 	}
@@ -133,6 +136,7 @@ func ActivateRebuiltFilmListSnapshot(version string) error {
 	RefreshAccessDataCaches()
 	ClearAdminFilmSearchCache()
 	pruneOldFilmListSnapshots(snapshotRetainVersions)
+	pruneOldFilterOptionSnapshots(snapshotRetainVersions)
 	return nil
 }
 
@@ -718,6 +722,7 @@ func RefreshAccessDataCaches() {
 		fmt.Sprintf("%s:*", config.TVBoxNetworkConfigCacheKey),
 		fmt.Sprintf("%s:*", config.FilmClassifyCacheKey),
 		fmt.Sprintf("%s:*", config.SearchTags),
+		"EcoHub:filter_option:*",
 	)
 }
 
@@ -728,11 +733,24 @@ func ClearSnapshotState() {
 }
 
 func clearCachePatterns(patterns ...string) {
+	if db.Rdb == nil {
+		return
+	}
 	for _, pattern := range patterns {
 		iter := db.Rdb.Scan(db.Cxt, 0, pattern, config.MaxScanCount).Iterator()
+		var batch []string
 		for iter.Next(db.Cxt) {
-			if err := db.Rdb.Del(db.Cxt, iter.Val()).Err(); err != nil {
-				log.Printf("clearCachePatterns Del Error: key=%s err=%v", iter.Val(), err)
+			batch = append(batch, iter.Val())
+			if len(batch) >= 100 {
+				if err := db.Rdb.Del(db.Cxt, batch...).Err(); err != nil {
+					log.Printf("clearCachePatterns Batch Del Error: count=%d err=%v", len(batch), err)
+				}
+				batch = batch[:0]
+			}
+		}
+		if len(batch) > 0 {
+			if err := db.Rdb.Del(db.Cxt, batch...).Err(); err != nil {
+				log.Printf("clearCachePatterns Final Batch Del Error: count=%d err=%v", len(batch), err)
 			}
 		}
 		if err := iter.Err(); err != nil {

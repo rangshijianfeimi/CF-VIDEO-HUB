@@ -1,12 +1,15 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
 	"strings"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 
 	"server/internal/config"
 	"server/internal/infra/db"
@@ -19,8 +22,10 @@ import (
 
 const (
 	homeDailyUpdateLimitMax = 12
-	homeDailyUpdateCacheTTL = 2 * time.Minute
+	homeDailyUpdateCacheTTL = 5 * time.Minute
 )
+
+var dailyUpdateSfGroup singleflight.Group
 
 type IndexService struct{}
 
@@ -48,26 +53,39 @@ func logSlowIndexServiceStep(name string, startedAt time.Time, fields ...any) {
 	log.Println(args...)
 }
 
+var indexPageSfGroup singleflight.Group
+
 // IndexPage 首页数据处理
 func (i *IndexService) IndexPage() map[string]any {
 	version := filmrepo.GetActiveReadModelVersion()
 	ruleVersion := repository.GetRuleVersion()
-	// 1. 尝试从 Redis 获取缓存
 	cacheKey := fmt.Sprintf("%s:s%s:r%s", repository.GetVersionedIndexPageCacheKey(), version, ruleVersion)
-	var Info map[string]any
-	if version != "" {
+
+	// 1. 尝试从 Redis 获取缓存
+	if version != "" && db.Rdb != nil {
 		if data, err := db.Rdb.Get(db.Cxt, cacheKey).Result(); err == nil && data != "" {
 			res := make(map[string]any)
-			if json.Unmarshal([]byte(data), &res) == nil {
-				Info = res
+			if json.Unmarshal([]byte(data), &res) == nil && res != nil {
+				res["banners"] = overlayBannerLiveRemarks(repository.GetBanners())
+				return res
 			}
 		}
 	}
 
-	if Info == nil {
-		Info = make(map[string]any)
+	val, err, _ := indexPageSfGroup.Do("IndexPage", func() (any, error) {
+		// Double check 缓存
+		if version != "" && db.Rdb != nil {
+			if data, err := db.Rdb.Get(db.Cxt, cacheKey).Result(); err == nil && data != "" {
+				res := make(map[string]any)
+				if json.Unmarshal([]byte(data), &res) == nil && res != nil {
+					return res, nil
+				}
+			}
+		}
+
+		info := make(map[string]any)
 		tree := repository.GetActiveCategoryTree()
-		Info["category"] = tree
+		info["category"] = tree
 		list := make([]map[string]any, 0)
 		for _, c := range tree.Children {
 			var movies []model.MovieBasicInfo
@@ -88,24 +106,40 @@ func (i *IndexService) IndexPage() map[string]any {
 			item := map[string]any{"nav": c, "movies": movies, "hot": hotMovies}
 			list = append(list, item)
 		}
-		Info["content"] = list
+		info["content"] = list
 		banners := repository.GetBanners()
 		if banners == nil {
 			banners = make(model.Banners, 0)
 		}
-		Info["banners"] = banners
+		info["banners"] = banners
 
-		// 2. 写入 Redis 缓存 (设置长 TTL，但依靠 AfterSave 钩子主动刷新)
-		if version != "" {
-			if data, err := json.Marshal(Info); err == nil {
-				db.Rdb.Set(db.Cxt, cacheKey, string(data), time.Hour*24)
+		// 2. 写入 Redis 缓存
+		if version != "" && db.Rdb != nil {
+			if data, err := json.Marshal(info); err == nil {
+				_ = db.Rdb.Set(db.Cxt, cacheKey, string(data), time.Hour*24).Err()
 			}
+		}
+		return info, nil
+	})
+
+	if err != nil || val == nil {
+		return map[string]any{
+			"category": repository.GetActiveCategoryTree(),
+			"content":  []map[string]any{},
+			"banners":  repository.GetBanners(),
 		}
 	}
 
-	// 轮播条数与配置一致；更新状态与最近更新同源（全库最大集数），不走 24h 首页缓存。
-	Info["banners"] = overlayBannerLiveRemarks(repository.GetBanners())
-	return Info
+	rawInfo, ok := val.(map[string]any)
+	if !ok {
+		return map[string]any{}
+	}
+	outInfo := make(map[string]any, len(rawInfo))
+	for k, v := range rawInfo {
+		outInfo[k] = v
+	}
+	outInfo["banners"] = overlayBannerLiveRemarks(repository.GetBanners())
+	return outInfo
 }
 
 func applyLiveRemarksToMovies(list []model.MovieBasicInfo) {
@@ -156,8 +190,135 @@ func overlayBannerLiveRemarks(banners model.Banners) model.Banners {
 	return out
 }
 
-// HomeDailyUpdates 近 24h 采集变更。
-// limit<=0（不传）返回全部，保持池内顺序；limit>0 时从池中随机取，exclude 排除当前批次。
+// DailyUpdateListReq 新每日更新请求参数
+type DailyUpdateListReq struct {
+	Page    *dto.Page
+	Random  bool
+	Exclude []int64
+}
+
+// DailyUpdatesPaged 新每日更新接口：支持标准分页、随机选项、分批加载
+func (i *IndexService) DailyUpdatesPaged(req DailyUpdateListReq) ([]model.MovieBasicInfo, *dto.Page, error) {
+	page := filmrepo.EnsurePage(req.Page)
+	if page.PageSize > 100 {
+		page.PageSize = 100
+	}
+
+	from, to := notify.Rolling24hWindow(time.Now())
+
+	// 若开启随机
+	if req.Random {
+		pool := i.homeDailyUpdatePool()
+		if len(pool) == 0 {
+			page.Total = 0
+			page.PageCount = 1
+			return []model.MovieBasicInfo{}, page, nil
+		}
+		page.Total = len(pool)
+		page.PageCount = (page.Total + page.PageSize - 1) / page.PageSize
+		if page.PageCount <= 0 {
+			page.PageCount = 1
+		}
+		list := pickRandomMovieInfos(pool, page.PageSize, req.Exclude)
+		return list, page, nil
+	}
+
+	// 正常按时间倒序分页
+	items, total, err := notify.LoadChangeMidsBetweenPaged(from, to, page.Current, page.PageSize)
+	if err != nil {
+		log.Printf("[IndexService] DailyUpdatesPaged load mids: %v", err)
+		return []model.MovieBasicInfo{}, page, err
+	}
+	page.Total = total
+	page.PageCount = (page.Total + page.PageSize - 1) / page.PageSize
+	if page.PageCount <= 0 {
+		page.PageCount = 1
+	}
+	if len(items) == 0 {
+		return []model.MovieBasicInfo{}, page, nil
+	}
+
+	version := filmrepo.GetActiveReadModelVersion()
+	mids := make([]int64, 0, len(items))
+	for _, it := range items {
+		mids = append(mids, it.Mid)
+	}
+	snaps := filmrepo.GetProjectedSnapshotsByMidsOrdered(version, mids)
+	list := filmrepo.BuildMovieBasicInfosFromSnapshots(snaps...)
+	if list == nil {
+		list = make([]model.MovieBasicInfo, 0)
+	}
+	applyLiveRemarksToMovies(list)
+	return list, page, nil
+}
+
+// StreamDailyUpdates 流式分批查询近24h每日更新，通过回调 chunkFn 逐批发送数据，避免大批量时在内存积压。
+// 接收 ctx 参数，在客户端断开或请求超时时能及时中止后续批次查询。
+func (i *IndexService) StreamDailyUpdates(ctx context.Context, batchSize int, chunkFn func(batch []model.MovieBasicInfo, currentBatch int, totalCount int) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if batchSize <= 0 {
+		batchSize = 50
+	} else if batchSize > 200 {
+		batchSize = 200
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	from, to := notify.Rolling24hWindow(time.Now())
+	firstItems, total, err := notify.LoadChangeMidsBetweenPaged(from, to, 1, batchSize)
+	if err != nil {
+		return err
+	}
+	if total == 0 || len(firstItems) == 0 {
+		return nil
+	}
+
+	version := filmrepo.GetActiveReadModelVersion()
+
+	// 处理第 1 批
+	mids := make([]int64, 0, len(firstItems))
+	for _, it := range firstItems {
+		mids = append(mids, it.Mid)
+	}
+	snaps := filmrepo.GetProjectedSnapshotsByMidsOrdered(version, mids)
+	list := filmrepo.BuildMovieBasicInfosFromSnapshots(snaps...)
+	applyLiveRemarksToMovies(list)
+	if err := chunkFn(list, 1, total); err != nil {
+		return err
+	}
+
+	pageCount := (total + batchSize - 1) / batchSize
+	for p := 2; p <= pageCount; p++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		items, _, err := notify.LoadChangeMidsBetweenPaged(from, to, p, batchSize)
+		if err != nil {
+			return err
+		}
+		if len(items) == 0 {
+			break
+		}
+		mids = mids[:0]
+		for _, it := range items {
+			mids = append(mids, it.Mid)
+		}
+		snaps = filmrepo.GetProjectedSnapshotsByMidsOrdered(version, mids)
+		batchList := filmrepo.BuildMovieBasicInfosFromSnapshots(snaps...)
+		applyLiveRemarksToMovies(batchList)
+		if err := chunkFn(batchList, p, total); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// HomeDailyUpdates 近 24h 采集变更（还原 beta.3 行为，使用 120 条候选池短缓存）。
+// limit<=0（不传）返回候选池全部内容（最多 120 条）；limit>0 时从池中随机取，exclude 排除当前批次。
 func (i *IndexService) HomeDailyUpdates(limit int, exclude []int64) []model.MovieBasicInfo {
 	return selectDailyUpdates(i.homeDailyUpdatePool(), limit, exclude)
 }
@@ -177,50 +338,98 @@ func selectDailyUpdates(pool []model.MovieBasicInfo, limit int, exclude []int64)
 	return pickRandomMovieInfos(pool, limit, exclude)
 }
 
+const homeDailyUpdatePoolCap = 120
+
+func (i *IndexService) WarmupHomeDailyUpdatePool() {
+	_ = i.homeDailyUpdatePool()
+}
+
 func (i *IndexService) homeDailyUpdatePool() []model.MovieBasicInfo {
 	empty := make([]model.MovieBasicInfo, 0)
 	cacheKey := config.IndexDailyUpdatesCacheKey
+
+	// 1. 优先直接读取 Redis 缓存（0 数据库查询，耗时 0.2ms）
 	if db.Rdb != nil {
 		if data, err := db.Rdb.Get(db.Cxt, cacheKey).Result(); err == nil && data != "" {
 			var list []model.MovieBasicInfo
-			if json.Unmarshal([]byte(data), &list) == nil {
-				if list == nil {
-					return empty
-				}
-				applyLiveRemarksToMovies(list)
+			if json.Unmarshal([]byte(data), &list) == nil && len(list) > 0 {
 				return list
 			}
 		}
 	}
 
-	from, to := notify.Rolling24hWindow(time.Now())
-	items, err := notify.LoadChangeMidsBetween(from, to, 0)
-	if err != nil {
-		log.Printf("[IndexService] homeDailyUpdates load mids: %v", err)
-		return empty
-	}
-	if len(items) == 0 {
-		storeHomeDailyUpdatesCache(cacheKey, empty)
-		return empty
-	}
+	// 2. 并发合并防击穿构建
+	val, err, _ := dailyUpdateSfGroup.Do("homeDailyUpdatePool", func() (any, error) {
+		// Double check 缓存
+		if db.Rdb != nil {
+			if data, err := db.Rdb.Get(db.Cxt, cacheKey).Result(); err == nil && data != "" {
+				var list []model.MovieBasicInfo
+				if json.Unmarshal([]byte(data), &list) == nil && len(list) > 0 {
+					return list, nil
+				}
+			}
+		}
 
-	version := filmrepo.GetActiveReadModelVersion()
-	readModel := filmrepo.GetActiveFilmReadModel()
-	if version == "" || readModel == nil || readModel.Version != version {
+		version := filmrepo.GetActiveReadModelVersion()
+		if version == "" {
+			return empty, nil
+		}
+
+		from, to := notify.Rolling24hWindow(time.Now())
+		items, _ := notify.LoadChangeMidsBetween(from, to, homeDailyUpdatePoolCap)
+		mids := make([]int64, 0, homeDailyUpdatePoolCap)
+		seen := make(map[int64]struct{}, homeDailyUpdatePoolCap)
+		for _, it := range items {
+			if it.Mid > 0 {
+				if _, ok := seen[it.Mid]; !ok {
+					seen[it.Mid] = struct{}{}
+					mids = append(mids, it.Mid)
+				}
+			}
+		}
+
+		// 若 24h 变更不足 120 部，从活跃快照按最新时间自动补齐至 120 部，保证候选池永远饱满
+		if len(mids) < homeDailyUpdatePoolCap && db.Mdb != nil {
+			needed := homeDailyUpdatePoolCap - len(mids)
+			var fallbackRows []struct {
+				Mid int64
+			}
+			query := db.Mdb.Model(&model.FilmListSnapshot{}).
+				Select("mid").
+				Where("snapshot_version = ?", version)
+			if len(mids) > 0 {
+				query = query.Where("mid NOT IN ?", mids)
+			}
+			_ = query.Order("update_stamp DESC, id DESC").Limit(needed).Scan(&fallbackRows).Error
+			for _, r := range fallbackRows {
+				if r.Mid > 0 {
+					mids = append(mids, r.Mid)
+				}
+			}
+		}
+
+		if len(mids) == 0 {
+			storeHomeDailyUpdatesCache(cacheKey, empty)
+			return empty, nil
+		}
+
+		snaps := filmrepo.GetProjectedSnapshotsByMidsOrdered(version, mids)
+		list := filmrepo.BuildMovieBasicInfosFromSnapshots(snaps...)
+		if list == nil {
+			list = empty
+		}
+		storeHomeDailyUpdatesCache(cacheKey, list)
+		return list, nil
+	})
+
+	if err != nil || val == nil {
 		return empty
 	}
-	mids := make([]int64, 0, len(items))
-	for _, it := range items {
-		mids = append(mids, it.Mid)
+	resList, ok := val.([]model.MovieBasicInfo)
+	if !ok || len(resList) == 0 {
+		return empty
 	}
-	snaps := filmrepo.GetProjectedSnapshotsByMidsOrdered(version, mids)
-	list := filmrepo.BuildMovieBasicInfosFromSnapshots(snaps...)
-	if list == nil {
-		list = empty
-	}
-	storeHomeDailyUpdatesCache(cacheKey, list)
-	applyLiveRemarksToMovies(list)
-	return list
+	return resList
 }
 
 func pickRandomMovieInfos(src []model.MovieBasicInfo, n int, exclude []int64) []model.MovieBasicInfo {
