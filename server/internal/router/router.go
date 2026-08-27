@@ -43,14 +43,19 @@ func SetupRouter() *gin.Engine {
 	{
 		manageRoute.GET(`/index`, handler.ManageHd.ManageIndex)
 		manageRoute.GET(`/version`, handler.ManageHd.AppVersion)
-		manageRoute.POST(`/version/upgrade`, handler.ManageHd.UpgradeApp)
+		manageRoute.POST(`/version/upgrade`, middleware.AdminAccess(), handler.ManageHd.UpgradeApp)
 
 		// 系统相关
 		sysConfig := manageRoute.Group(`/config`)
 		{
 			sysConfig.GET(`/basic`, handler.ManageHd.SiteBasicConfig)
 			sysConfig.POST(`/basic/update`, handler.ManageHd.UpdateSiteBasic)
-			sysConfig.POST(`/basic/reset`, handler.ManageHd.ResetSiteBasic)
+
+			sysConfig.GET(`/tip`, handler.ManageHd.SiteTipConfig)
+			sysConfig.POST(`/tip/update`, handler.ManageHd.UpdateSiteTip)
+
+			sysConfig.GET(`/notice`, handler.ManageHd.SiteNoticeConfig)
+			sysConfig.POST(`/notice/update`, handler.ManageHd.UpdateSiteNotice)
 
 			sysConfig.GET(`/notify`, handler.NotifyHd.GetNotifyConfig)
 			sysConfig.POST(`/notify/update`, handler.NotifyHd.UpdateNotifyConfig)

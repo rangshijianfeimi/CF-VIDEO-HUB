@@ -1,9 +1,8 @@
 "use client";
 
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
   Table,
-  Tag,
   Button,
   Space,
   Select,
@@ -11,69 +10,30 @@ import {
   Popconfirm,
   Pagination,
   Tooltip,
-  Typography,
-  Card,
 } from "antd";
 import {
   SearchOutlined,
   ReloadOutlined,
   DeleteOutlined,
-  WarningOutlined,
+  ClearOutlined,
+  QuestionCircleOutlined,
 } from "@ant-design/icons";
-import type { ColumnsType } from "antd/es/table";
 import { ApiGet, ApiPost } from "@/lib/client-api";
-import dayjs from "dayjs";
 import { useAppMessage } from "@/lib/useAppMessage";
 import { useManagePermission } from "@/lib/manage-permission";
 import ManagePageHeader from "@/app/manage/components/page-header";
+import { FailRecord, FAILURE_RECORD_STATUS } from "./types";
+import { getRecordColumns, normalizeStatusOptionLabel } from "./columns";
 import styles from "./index.module.less";
 
 const { RangePicker } = DatePicker;
-const RECOVER_MAX_RETRY_COUNT = 5;
-
-interface FailRecord {
-  ID: number;
-  originName: string;
-  originId: string;
-  pageNumber: number;
-  hour: number;
-  cause: string;
-  status: number;
-  retryCount: number;
-  CreatedAt: string;
-  UpdatedAt: string;
-}
-
-const FAILURE_RECORD_STATUS = {
-  pending: 1,
-  success: 0,
-  failed: 2,
-} as const;
-
-function renderStatusTag(status: number) {
-  if (status === FAILURE_RECORD_STATUS.pending) {
-    return <Tag color="processing">待自动重试</Tag>;
-  }
-  if (status === FAILURE_RECORD_STATUS.success) {
-    return <Tag color="success">重试成功</Tag>;
-  }
-  return <Tag color="error">最终失败</Tag>;
-}
-
-function normalizeStatusOptionLabel(name: string, value: number) {
-  if (value === FAILURE_RECORD_STATUS.pending) {
-    return "待自动重试";
-  }
-  if (value === FAILURE_RECORD_STATUS.failed) {
-    return "最终失败";
-  }
-  return name;
-}
 
 export default function FailureRecordPageView() {
   const [records, setRecords] = useState<FailRecord[]>([]);
   const [loading, setLoading] = useState(false);
   const [queuedRetryIds, setQueuedRetryIds] = useState<Set<number>>(() => new Set());
+  const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([]);
+  const [batchRetrying, setBatchRetrying] = useState(false);
   const [page, setPage] = useState({ current: 1, pageSize: 10, total: 0 });
   const [params, setParams] = useState({
     originId: "",
@@ -86,14 +46,22 @@ export default function FailureRecordPageView() {
     origin: [],
     status: [],
   });
+
+  const pageRef = useRef(page);
+  pageRef.current = page;
+  const paramsRef = useRef(params);
+  paramsRef.current = params;
+
   const { message } = useAppMessage();
   const { canWrite } = useManagePermission();
 
   const getRecords = useCallback(
-    async (p?: any, overrideParams?: any) => {
-      setLoading(true);
-      const pg = p || page;
-      const reqParams = overrideParams || params;
+    async (p?: any, overrideParams?: any, silent = false) => {
+      if (!silent) {
+        setLoading(true);
+      }
+      const pg = p || pageRef.current;
+      const reqParams = overrideParams || paramsRef.current;
       try {
         const resp = await ApiGet("/manage/collect/record/list", {
           ...reqParams,
@@ -103,17 +71,22 @@ export default function FailureRecordPageView() {
         if (resp.code === 0) {
           setRecords(resp.data.list || []);
           if (resp.data.params?.paging) {
-            setPage(resp.data.params.paging);
+            setPage((prev) => ({
+              ...prev,
+              ...resp.data.params.paging,
+            }));
           }
           if (resp.data.options) {
             setOptions(resp.data.options);
           }
         }
       } finally {
-        setLoading(false);
+        if (!silent) {
+          setLoading(false);
+        }
       }
     },
-    [params, page],
+    [],
   );
 
   useEffect(() => {
@@ -121,149 +94,145 @@ export default function FailureRecordPageView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const handleRetry = async (id: number) => {
-    const resp = await ApiPost("/manage/collect/record/retry", { id });
-    if (resp.code === 0) {
+  const handleRetry = useCallback(
+    async (id: number) => {
       setQueuedRetryIds((prev) => new Set(prev).add(id));
-      message.success("重试任务已加入队列；如果对应采集站正在采集，会在采集结束后自动执行");
-      window.setTimeout(() => {
+      const resp = await ApiPost("/manage/collect/record/retry", { id });
+      if (resp.code === 0) {
+        message.success("重试任务已加入队列");
+        window.setTimeout(() => {
+          setQueuedRetryIds((prev) => {
+            const next = new Set(prev);
+            next.delete(id);
+            return next;
+          });
+          void getRecords(undefined, undefined, true);
+        }, 3000);
+      } else {
         setQueuedRetryIds((prev) => {
           const next = new Set(prev);
           next.delete(id);
           return next;
         });
-      }, 5000);
-      void getRecords();
-    } else message.error(resp.msg);
+        message.error(resp.msg);
+      }
+    },
+    [getRecords, message],
+  );
+
+  const handleRetrySelected = async () => {
+    const targets = records.filter(
+      (r) => selectedRowKeys.includes(r.ID) && r.status !== FAILURE_RECORD_STATUS.success,
+    );
+    if (targets.length === 0) {
+      message.warning("所选记录均已重试成功，无需重复重试");
+      return;
+    }
+
+    const targetIds = targets.map((t) => t.ID);
+    setQueuedRetryIds((prev) => {
+      const next = new Set(prev);
+      targetIds.forEach((id) => next.add(id));
+      return next;
+    });
+
+    setBatchRetrying(true);
+    let successCount = 0;
+    let failCount = 0;
+
+    for (const target of targets) {
+      const resp = await ApiPost("/manage/collect/record/retry", { id: target.ID });
+      if (resp.code === 0) {
+        successCount++;
+      } else {
+        failCount++;
+      }
+    }
+
+    setBatchRetrying(false);
+    setSelectedRowKeys([]);
+    message.success(`已提交重试任务：成功 ${successCount} 条，失败 ${failCount} 条`);
+
+    window.setTimeout(() => {
+      setQueuedRetryIds((prev) => {
+        const next = new Set(prev);
+        targetIds.forEach((id) => next.delete(id));
+        return next;
+      });
+      void getRecords(undefined, undefined, true);
+    }, 3000);
   };
 
   const handleRetryAll = async () => {
+    const pendingIds = records
+      .filter((r) => r.status === FAILURE_RECORD_STATUS.pending)
+      .map((r) => r.ID);
+    setQueuedRetryIds((prev) => {
+      const next = new Set(prev);
+      pendingIds.forEach((id) => next.add(id));
+      return next;
+    });
+
     const resp = await ApiPost("/manage/collect/record/retry/all", {});
-    if (resp.code === 0) {
-      message.success(resp.msg);
-      void getRecords();
-    } else message.error(resp.msg);
+    if (resp.code !== 0) {
+      setQueuedRetryIds((prev) => {
+        const next = new Set(prev);
+        pendingIds.forEach((id) => next.delete(id));
+        return next;
+      });
+      message.error(resp.msg);
+      return;
+    }
+
+    message.success(resp.msg || "已触发全量待处理项重试，系统正在后台并发执行");
+
+    window.setTimeout(() => {
+      setQueuedRetryIds((prev) => {
+        const next = new Set(prev);
+        pendingIds.forEach((id) => next.delete(id));
+        return next;
+      });
+      void getRecords(undefined, undefined, true);
+    }, 4000);
   };
 
   const handleCleanResult = async () => {
     const resp = await ApiPost("/manage/collect/record/clear/result", {});
     if (resp.code === 0) {
-      message.success(resp.msg);
-      getRecords();
-    } else message.error(resp.msg);
+      message.success(resp.msg || "已清理所有已完结（成功/最终失败）记录");
+      setSelectedRowKeys([]);
+      void getRecords();
+    } else {
+      message.error(resp.msg);
+    }
   };
 
   const handleCleanAll = async () => {
     const resp = await ApiPost("/manage/collect/record/clear/all", {});
     if (resp.code === 0) {
-      message.success(resp.msg);
-      getRecords();
-    } else message.error(resp.msg);
+      message.success(resp.msg || "已清空所有失败记录");
+      setSelectedRowKeys([]);
+      void getRecords();
+    } else {
+      message.error(resp.msg);
+    }
   };
 
-  const columns: ColumnsType<FailRecord> = [
-    {
-      title: "ID",
-      dataIndex: "ID",
-      width: 60,
-      fixed: "left",
-      align: "center",
-      render: (v) => (
-          <span style={{ color: "var(--ant-color-purple)" }}>{v}</span>
-      ),
-    },
-    {
-      title: "采集站",
-      dataIndex: "originName",
-      align: "center",
-      render: (v) => <Tag color="blue">{v}</Tag>,
-    },
-    {
-      title: "采集源ID",
-      dataIndex: "originId",
-      align: "center",
-      render: (v) => <Tag color="green">{v}</Tag>,
-    },
-    {
-      title: "分页页码",
-      dataIndex: "pageNumber",
-      align: "center",
-      render: (v) => <Tag color="orange">{v}</Tag>,
-    },
-    {
-      title: "采集时长",
-      dataIndex: "hour",
-      align: "center",
-      render: (v) => <Tag color="orange">{v}</Tag>,
-    },
-    {
-      title: "失败原因",
-      dataIndex: "cause",
-      align: "left",
-      ellipsis: true,
-      render: (v) => <Typography.Text type="danger">{v}</Typography.Text>,
-    },
-    {
-      title: "状态",
-      dataIndex: "status",
-      align: "center",
-      render: (v) => renderStatusTag(v),
-    },
-    {
-      title: "重试次数",
-      dataIndex: "retryCount",
-      align: "center",
-      render: (v) => {
-        const retryCount = v || 1;
-        const color = retryCount >= RECOVER_MAX_RETRY_COUNT ? "error" : retryCount > 1 ? "warning" : "default";
-        return <Tag color={color}>{retryCount}/{RECOVER_MAX_RETRY_COUNT}</Tag>;
-      },
-    },
-    {
-      title: "请求时间",
-      dataIndex: "CreatedAt",
-      align: "center",
-      render: (v) => dayjs(v).format("YYYY-MM-DD HH:mm:ss"),
-    },
-    {
-      title: "操作",
-      key: "action",
-      align: "center",
-      fixed: "right",
-      render: (_, record) => {
-        const isSuccess = record.status === FAILURE_RECORD_STATUS.success;
-        const isFinalFailed = record.status === FAILURE_RECORD_STATUS.failed;
-        const isQueued = queuedRetryIds.has(record.ID);
-        const tooltipTitle = isSuccess
-          ? "已重试成功，无需再次重试"
-          : isQueued
-            ? "已加入重试队列；同采集站全量采集中时会等待采集结束"
-          : isFinalFailed
-            ? "手动再试，失败后仍保持最终失败"
-            : "立即重试此记录";
-        return (
-          <Tooltip title={tooltipTitle}>
-            <Button
-              type="primary"
-              shape="circle"
-              size="small"
-              loading={isQueued}
-              disabled={!canWrite || isSuccess || isQueued}
-              style={isSuccess ? undefined : { background: "#52c41a", borderColor: "#52c41a" }}
-              icon={<ReloadOutlined />}
-              onClick={() => handleRetry(record.ID)}
-            />
-          </Tooltip>
-        );
-      },
-    },
-  ];
+  const columns = useMemo(
+    () =>
+      getRecordColumns({
+        canWrite,
+        queuedRetryIds,
+        onRetry: handleRetry,
+      }),
+    [canWrite, queuedRetryIds, handleRetry],
+  );
 
   return (
     <div className={styles.pageBody}>
       <ManagePageHeader
         title="失败记录"
-        description="查看采集失败明细、自动重试次数和最终失败记录，并统一清理已有重试结果或全部失败记录。"
+        description="管理影视采集失败记录。支持针对性重试待处理页码、清理已完结归档，以及全表数据维护。"
       />
 
       <Space size={[8, 8]} wrap className={styles.filterBar}>
@@ -309,7 +278,7 @@ export default function FailureRecordPageView() {
           type="primary"
           icon={<SearchOutlined />}
           onClick={() => {
-            const newPage = { ...page, current: 1 };
+            const newPage = { ...pageRef.current, current: 1 };
             setPage(newPage);
             void getRecords(newPage, params);
           }}
@@ -328,7 +297,7 @@ export default function FailureRecordPageView() {
             };
             setParams(defaultParams);
             setDateRange(null);
-            const newPage = { ...page, current: 1 };
+            const newPage = { ...pageRef.current, current: 1 };
             setPage(newPage);
             void getRecords(newPage, defaultParams);
           }}
@@ -346,32 +315,90 @@ export default function FailureRecordPageView() {
         size="middle"
         pagination={false}
         scroll={{ x: "max-content" }}
+        rowSelection={
+          canWrite
+            ? {
+                selectedRowKeys,
+                onChange: (keys) => setSelectedRowKeys(keys),
+                getCheckboxProps: (record) => ({
+                  disabled:
+                    queuedRetryIds.has(record.ID) ||
+                    record.status === FAILURE_RECORD_STATUS.success,
+                }),
+              }
+            : undefined
+        }
         title={() => (
           <div className={styles.tableHeader}>
-            <div className={styles.tableTitle}>失败记录列表</div>
+            <div className={styles.tableTitle}>
+              失败记录列表
+              {selectedRowKeys.length > 0 && (
+                <span className={styles.selectionCount}>（已选中 {selectedRowKeys.length} 项）</span>
+              )}
+            </div>
             <Space size={[8, 8]} wrap className={styles.tableActions}>
-              <Popconfirm title="确认立即重试所有待自动重试记录？" onConfirm={handleRetryAll}>
-                <Button type="primary" icon={<ReloadOutlined />} disabled={!canWrite}>
-                  重试待重试记录
-                </Button>
-              </Popconfirm>
-              <Popconfirm title="确认清除已有重试结果的记录？" onConfirm={handleCleanResult}>
+              {selectedRowKeys.length > 0 && (
                 <Button
-                  icon={<WarningOutlined />}
+                  type="primary"
+                  icon={<ReloadOutlined />}
+                  loading={batchRetrying}
                   disabled={!canWrite}
-                  style={{
-                    color: "var(--ant-color-warning)",
-                    borderColor: "var(--ant-color-warning)",
-                  }}
+                  onClick={handleRetrySelected}
                 >
-                  清除重试结果
+                  重试选中项 ({selectedRowKeys.length})
                 </Button>
-              </Popconfirm>
-              <Popconfirm title="确认清除所有记录？" onConfirm={handleCleanAll}>
-                <Button danger icon={<DeleteOutlined />} disabled={!canWrite}>
-                  清除所有
-                </Button>
-              </Popconfirm>
+              )}
+
+              <Tooltip title="并发拉取所有状态为「待自动重试」的页面进行重试采集">
+                <Popconfirm
+                  title="确认重试所有待处理记录？"
+                  description="系统将并发拉取所有待自动重试状态的页面，已成功和已超限失败的记录不受影响。"
+                  icon={<QuestionCircleOutlined style={{ color: "#1677ff" }} />}
+                  onConfirm={handleRetryAll}
+                  disabled={!canWrite}
+                >
+                  <Button type="primary" icon={<ReloadOutlined />} disabled={!canWrite}>
+                    重试全部待处理
+                  </Button>
+                </Popconfirm>
+              </Tooltip>
+
+              <Tooltip title="安全清理：删除数据库中所有「重试成功」与「最终失败」的历史记录，保留待重试项">
+                <Popconfirm
+                  title="确认清理所有已完结记录？"
+                  description="将删除所有已成功和最终失败的历史归档，待自动重试的记录将继续保留。"
+                  icon={<QuestionCircleOutlined style={{ color: "var(--ant-color-warning)" }} />}
+                  onConfirm={handleCleanResult}
+                  disabled={!canWrite}
+                >
+                  <Button
+                    icon={<ClearOutlined />}
+                    disabled={!canWrite}
+                    style={{
+                      color: "var(--ant-color-warning)",
+                      borderColor: "var(--ant-color-warning)",
+                    }}
+                  >
+                    清理已完结记录
+                  </Button>
+                </Popconfirm>
+              </Tooltip>
+
+              <Tooltip title="高危操作：清空失败记录全表数据（包括所有待重试项）">
+                <Popconfirm
+                  title="确认清空全部失败记录？"
+                  description="警告：此操作将永久清空表中所有记录（包括待处理项），不可恢复！"
+                  okType="danger"
+                  okText="确定清空"
+                  cancelText="取消"
+                  onConfirm={handleCleanAll}
+                  disabled={!canWrite}
+                >
+                  <Button danger icon={<DeleteOutlined />} disabled={!canWrite}>
+                    清空全部记录
+                  </Button>
+                </Popconfirm>
+              </Tooltip>
             </Space>
           </div>
         )}
@@ -385,9 +412,9 @@ export default function FailureRecordPageView() {
               showTotal={(total) => `共 ${total} 条`}
               pageSizeOptions={[10, 20, 50, 100, 500]}
               onChange={(current, pageSize) => {
-                const newPage = { ...page, current, pageSize };
+                const newPage = { ...pageRef.current, current, pageSize };
                 setPage(newPage);
-                getRecords(newPage);
+                void getRecords(newPage);
               }}
             />
           </div>
