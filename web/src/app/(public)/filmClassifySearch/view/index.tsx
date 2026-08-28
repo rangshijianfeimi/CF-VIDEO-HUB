@@ -1,53 +1,39 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
-import { LeftOutlined, RightOutlined } from "@ant-design/icons";
+import React, { useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
+import {
+  AppstoreOutlined,
+  CompassOutlined,
+  FilterOutlined,
+} from "@ant-design/icons";
 import { useRouter } from "next/navigation";
 import { Pagination } from "antd";
 import FilmList from "@/components/public/FilmList";
 import AppLoading from "@/components/public/Loading";
-import styles from "./index.module.less";
+import { useContentNavigate } from "@/components/public/PublicContentLoading";
 import {
   forceFinishNavigationLoading,
   startNavigationLoading,
 } from "@/components/public/TopLoadingBar";
+import DesktopFilterPanel, { ActiveChipItem } from "./components/DesktopFilterPanel";
+import MobileFilterDrawer from "./components/MobileFilterDrawer";
+import styles from "./index.module.less";
 
-/**
- * 单行筛选行滚动箭头 Hook
- * 检测 .options 容器是否可向左/右滚动，提供滚动方法
- */
-function useScrollArrows(dep: string) {
-  const ref = useRef<HTMLDivElement>(null);
-  const [canLeft, setCanLeft] = useState(false);
-  const [canRight, setCanRight] = useState(false);
+function normalizeTagValue(value: unknown) {
+  return typeof value === "string" ? value.trim() : "";
+}
 
-  const check = useCallback(() => {
-    const el = ref.current;
-    if (!el) return;
-    setCanLeft(el.scrollLeft > 2);
-    setCanRight(el.scrollLeft + el.clientWidth < el.scrollWidth - 2);
-  }, []);
-
-  useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    check();
-    el.addEventListener("scroll", check, { passive: true });
-    const ro = new ResizeObserver(check);
-    ro.observe(el);
-    return () => {
-      el.removeEventListener("scroll", check);
-      ro.disconnect();
-    };
-  }, [check, dep]);
-
-  const scrollBy = useCallback((dir: number) => {
-    const el = ref.current;
-    if (!el) return;
-    el.scrollBy({ left: dir * el.clientWidth * 0.6, behavior: "smooth" });
-  }, []);
-
-  return { ref, canLeft, canRight, scrollLeft: () => scrollBy(-1), scrollRight: () => scrollBy(1) };
+function getSafeTags(tags: any[] | undefined) {
+  if (!Array.isArray(tags)) {
+    return [];
+  }
+  return tags.filter((tag, index) => {
+    const value = normalizeTagValue(tag?.Value);
+    if (value !== "") {
+      return true;
+    }
+    return index === 0 && tag?.Name === "全部";
+  });
 }
 
 export default function FilmClassifySearchPageView({
@@ -58,9 +44,10 @@ export default function FilmClassifySearchPageView({
   currentParams: Record<string, string>;
 }) {
   const router = useRouter();
+  const { navigate } = useContentNavigate();
   const [isRoutePending, startTransition] = useTransition();
   const [navigatingUrl, setNavigatingUrl] = useState("");
-  const { title, list, search, params, page } = data;
+  const { title, list, search, params, page } = data || {};
   const safeList = Array.isArray(list) ? list : [];
   const safeSearch = {
     titles: search?.titles ?? {},
@@ -68,8 +55,10 @@ export default function FilmClassifySearchPageView({
     tags: search?.tags ?? {},
   };
   const safeParams = params ?? {};
-  const safePage = page ?? { total: 0, pageSize: 20 };
-  const categoryKey = [safeParams.Pid || currentParams.Pid || "", safeParams.Category || currentParams.Category || ""].join(":");
+  const safePage = page ?? { total: 0, pageSize: 48 };
+  const pid = safeParams.Pid || currentParams.Pid || "0";
+  const categoryName = title?.name || "分类";
+  const categoryKey = [pid, safeParams.Category || currentParams.Category || ""].join(":");
 
   /** 语义化 query 比较：忽略键序与空值，避免 page 过滤假值后全等失败卡 loading */
   const normalizeQueryKey = useCallback((input: string | Record<string, string>) => {
@@ -123,21 +112,13 @@ export default function FilmClassifySearchPageView({
     return () => window.clearTimeout(timer);
   }, [navigatingUrl]);
 
-  const normalizeTagValue = (value: unknown) =>
-    typeof value === "string" ? value.trim() : "";
-
-  const getSafeTags = (tags: any[] | undefined) => {
-    if (!Array.isArray(tags)) {
-      return [];
+  const tagsMap = useMemo(() => {
+    const map: Record<string, any[]> = {};
+    for (const key of safeSearch.sortList) {
+      map[key] = getSafeTags(safeSearch.tags[key]);
     }
-    return tags.filter((tag, index) => {
-      const value = normalizeTagValue(tag?.Value);
-      if (value !== "") {
-        return true;
-      }
-      return index === 0 && tag?.Name === "全部";
-    });
-  };
+    return map;
+  }, [safeSearch.sortList, safeSearch.tags]);
 
   const pushFilterUrl = (nextUrl: string, barLabel: string) => {
     if (nextUrl === currentUrl || isPending) {
@@ -176,41 +157,142 @@ export default function FilmClassifySearchPageView({
     pushFilterUrl(`/filmClassifySearch?${nextParams.toString()}`, "加载列表中...");
   };
 
+  // 统计已激活的筛选条件列表
+  const activeChips = useMemo<ActiveChipItem[]>(() => {
+    const items: ActiveChipItem[] = [];
+    for (const key of safeSearch.sortList) {
+      const val = normalizeTagValue(currentParams[key]);
+      if (!val || val === "") continue;
+      if (key === "Sort" && (val === "update_stamp" || val === "default")) continue;
+
+      const tags = tagsMap[key] || [];
+      const matchTag = tags.find((t) => normalizeTagValue(t.Value) === val);
+      const name = matchTag?.Name || val;
+      const label = safeSearch.titles[key] || key;
+
+      items.push({ key, label, name, value: val });
+    }
+    return items;
+  }, [safeSearch.sortList, safeSearch.titles, tagsMap, currentParams]);
+
+  const handleRemoveChip = (key: string) => {
+    handleTagClick(key, "");
+  };
+
+  const handleResetFilters = () => {
+    if (isPending || activeChips.length === 0) {
+      return;
+    }
+    const nextParams = new URLSearchParams();
+    if (currentParams.Pid) {
+      nextParams.set("Pid", currentParams.Pid);
+    }
+    nextParams.set("current", "1");
+    pushFilterUrl(`/filmClassifySearch?${nextParams.toString()}`, "重置筛选中...");
+  };
+
+  const handleApplyFilters = (nextObj: Record<string, string>) => {
+    const nextParams = new URLSearchParams();
+    if (currentParams.Pid) {
+      nextParams.set("Pid", currentParams.Pid);
+    }
+    for (const [k, v] of Object.entries(nextObj)) {
+      if (v && v !== "" && k !== "Pid" && k !== "current") {
+        nextParams.set(k, v);
+      }
+    }
+    nextParams.set("current", "1");
+    pushFilterUrl(`/filmClassifySearch?${nextParams.toString()}`, "筛选影片中...");
+  };
+
   return (
     <div className={`${styles.container} ${isPending ? styles.isPending : ""}`}>
-      <div className={styles.resultHeader}>
-        <div className={styles.count}>
-          <span>{title?.name || "全部"}</span>共 {safePage.total ?? 0} 部影片
+      {/* 头部专区氛围卡片 */}
+      <header className={styles.heroHeader}>
+        <div className={styles.heroGlow} aria-hidden />
+        <div className={styles.heroContent}>
+          <div className={styles.heroMeta}>
+            <span className={styles.eyebrow}>
+              <FilterOutlined className={styles.eyebrowIcon} />
+              <span>片库检索 · 共 {safePage.total ?? 0} 部</span>
+            </span>
+            <h1 className={styles.heroTitle}>{categoryName}片库</h1>
+          </div>
+
+          <div className={styles.headerActions}>
+            <div className={styles.tabSwitcher}>
+              <button
+                type="button"
+                className={styles.tabBtn}
+                onClick={() =>
+                  navigate(`/filmClassify?Pid=${pid}`, "分类专区加载中...")
+                }
+              >
+                <AppstoreOutlined />
+                <span>精选推荐</span>
+              </button>
+              <button
+                type="button"
+                className={`${styles.tabBtn} ${styles.active}`}
+                onClick={() =>
+                  navigate(`/filmClassifySearch?Pid=${pid}`, "片库加载中...")
+                }
+              >
+                <CompassOutlined />
+                <span>全量片库</span>
+              </button>
+            </div>
+          </div>
         </div>
-      </div>
+      </header>
 
-      {/* 筛选区始终保留，不进入全屏 loading */}
-      <div className={styles.filterSection} aria-busy={isPending}>
-        {safeSearch.sortList.map((key: string) => (
-          <FilterRow
-            key={key}
-            filterKey={key}
-            label={safeSearch.titles[key]}
-            tags={getSafeTags(safeSearch.tags[key])}
-            activeValue={normalizeTagValue(safeParams[key])}
-            isPending={isPending}
-            onTagClick={handleTagClick}
-            normalizeTagValue={normalizeTagValue}
-          />
-        ))}
-      </div>
+      {/* PC 桌面端全量平铺筛选面板 (移动端隐藏) */}
+      {safeSearch.sortList.length > 0 && (
+        <DesktopFilterPanel
+          sortList={safeSearch.sortList}
+          titles={safeSearch.titles}
+          tagsMap={tagsMap}
+          activeParams={currentParams}
+          activeChips={activeChips}
+          total={safePage.total}
+          isPending={isPending}
+          onTagClick={handleTagClick}
+          onRemoveChip={handleRemoveChip}
+          onReset={handleResetFilters}
+          normalizeTagValue={normalizeTagValue}
+        />
+      )}
 
-      {/* 仅列表区域 loading */}
+      {/* 移动端常驻已选条件状态条 + 底部抽屉筛选 (PC 端隐藏) */}
+      {safeSearch.sortList.length > 0 && (
+        <MobileFilterDrawer
+          sortList={safeSearch.sortList}
+          titles={safeSearch.titles}
+          tagsMap={tagsMap}
+          activeParams={currentParams}
+          activeChips={activeChips}
+          total={safePage.total}
+          isPending={isPending}
+          onApplyFilters={handleApplyFilters}
+          onQuickSelect={handleTagClick}
+          onRemoveChip={handleRemoveChip}
+          onReset={handleResetFilters}
+          normalizeTagValue={normalizeTagValue}
+        />
+      )}
+
+      {/* 列表与局部加载 */}
       <div className={styles.content}>
         {isPending ? (
           <div className={styles.listLoading} role="status" aria-live="polite">
-            <AppLoading text="列表加载中" size="default" showHints={false} />
+            <AppLoading text="列表加载中..." size="default" showHints={false} />
           </div>
         ) : (
-          <FilmList key={categoryKey} list={safeList} className={styles.classifyGrid} />
+          <FilmList key={categoryKey} list={safeList} col={6} />
         )}
       </div>
 
+      {/* 分页控制 */}
       {!isPending && safeList.length > 0 && (
         <div className={styles.paginationWrapper}>
           <Pagination
@@ -227,69 +309,3 @@ export default function FilmClassifySearchPageView({
   );
 }
 
-/** 单行筛选行：带左右箭头滚动控制 */
-function FilterRow({
-  filterKey,
-  label,
-  tags,
-  activeValue,
-  isPending,
-  onTagClick,
-  normalizeTagValue,
-}: {
-  filterKey: string;
-  label: string;
-  tags: any[];
-  activeValue: string;
-  isPending: boolean;
-  onTagClick: (key: string, value: string) => void;
-  normalizeTagValue: (v: unknown) => string;
-}) {
-  const { ref, canLeft, canRight, scrollLeft, scrollRight } = useScrollArrows(filterKey);
-
-  return (
-    <div className={styles.filterRow}>
-      <div className={styles.label}>{label}</div>
-      <div className={styles.optionsWrap}>
-        {canLeft && (
-          <button
-            type="button"
-            className={`${styles.arrowBtn} ${styles.arrowLeft}`}
-            onClick={scrollLeft}
-            aria-label="向左滚动"
-            disabled={isPending}
-          >
-            <LeftOutlined />
-          </button>
-        )}
-        <div className={styles.options} ref={ref}>
-          {tags.map((tag: any, index: number) => (
-            <span
-              key={`${filterKey}-${tag.Value}-${tag.Name}-${index}`}
-              className={`${styles.option} ${activeValue === normalizeTagValue(tag.Value) ? styles.active : ""}`}
-              aria-disabled={isPending}
-              onClick={() => {
-                if (!isPending) {
-                  onTagClick(filterKey, tag.Value);
-                }
-              }}
-            >
-              {tag.Name}
-            </span>
-          ))}
-        </div>
-        {canRight && (
-          <button
-            type="button"
-            className={`${styles.arrowBtn} ${styles.arrowRight}`}
-            onClick={scrollRight}
-            aria-label="向右滚动"
-            disabled={isPending}
-          >
-            <RightOutlined />
-          </button>
-        )}
-      </div>
-    </div>
-  );
-}

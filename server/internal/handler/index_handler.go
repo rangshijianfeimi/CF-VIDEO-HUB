@@ -1,9 +1,7 @@
 package handler
 
 import (
-	"encoding/json"
 	"log"
-	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -118,114 +116,79 @@ func (h *IndexHandler) DailyUpdates(c *gin.Context) {
 	dto.Success(data, "每日更新获取成功", c)
 }
 
-// DailyUpdatesV2 新每日更新接口（全新独立接口，无需兼容老接口）：
-// 1. 支持流式传输（stream=1 或 stream=true，使用 NDJSON/chunked 逐步输出）
-// 2. 支持标准分页（page/pageSize 或 current/size）
-// 3. 支持随机轮换（random=1 或 random=true，搭配 exclude 参数）
+// DailyUpdatesV2 近 24h 更新：
+//
+//	pid=0 全部；pid=-1 其他；pid>0 导航大类
+//	current/page + pageSize/size 标准分页
+//	random=1 时按分类随机抽样，exclude 排除已出现的 mid
 func (h *IndexHandler) DailyUpdatesV2(c *gin.Context) {
-	stream := c.Query("stream") == "true" || c.Query("stream") == "1"
-	if stream {
-		batchSize, _ := strconv.Atoi(c.Query("batchSize"))
-		if batchSize <= 0 {
-			batchSize, _ = strconv.Atoi(c.Query("pageSize"))
-		}
-		if batchSize <= 0 {
-			batchSize, _ = strconv.Atoi(c.Query("size"))
-		}
-		if batchSize <= 0 {
-			batchSize = 50
-		}
-
-		c.Header("Content-Type", "application/x-ndjson; charset=utf-8")
-		c.Header("Transfer-Encoding", "chunked")
-		c.Header("Cache-Control", "no-cache")
-		c.Header("Connection", "keep-alive")
-
-		w := c.Writer
-		flusher, ok := w.(http.Flusher)
-
-		err := service.IndexSvc.StreamDailyUpdates(c.Request.Context(), batchSize, func(batch []model.MovieBasicInfo, currentBatch int, totalCount int) error {
-			chunk := gin.H{
-				"batch": currentBatch,
-				"total": totalCount,
-				"count": len(batch),
-				"list":  batch,
-			}
-			raw, marshalErr := json.Marshal(chunk)
-			if marshalErr != nil {
-				return marshalErr
-			}
-			if _, writeErr := w.Write(append(raw, '\n')); writeErr != nil {
-				return writeErr
-			}
-			if ok {
-				flusher.Flush()
-			}
-			return nil
-		})
-		if err != nil {
-			log.Printf("[DailyUpdatesV2] stream error: %v", err)
-			errChunk, _ := json.Marshal(gin.H{"error": err.Error()})
-			_, _ = w.Write(append(errChunk, '\n'))
-			if ok {
-				flusher.Flush()
-			}
-		}
-		return
-	}
-
-	pageParam := parseDailyUpdatePage(c)
-	if pageParam == nil {
-		pageParam = &dto.Page{Current: 1, PageSize: 20}
-	}
-	random := c.Query("random") == "true" || c.Query("random") == "1"
-	exclude := parseDailyUpdateExclude(c.Query("exclude"))
-
-	list, page, err := service.IndexSvc.DailyUpdatesPaged(service.DailyUpdateListReq{
-		Page:    pageParam,
-		Random:  random,
-		Exclude: exclude,
+	result, err := service.IndexSvc.DailyUpdatesV2(service.DailyUpdateListReq{
+		Pid: parseDailyUpdatePid(queryFirst(c, "pid", "Pid")),
+		Page: &dto.Page{
+			Current:  parseQueryInt(queryFirst(c, "page", "current"), 1),
+			PageSize: parseQueryInt(queryFirst(c, "pageSize", "size"), 21),
+		},
+		Random:  parseQueryBool(c.Query("random")),
+		Exclude: parseDailyUpdateExclude(c.Query("exclude")),
 	})
 	if err != nil {
 		dto.Failed("获取每日更新失败", c)
 		return
 	}
-
-	dto.Success(gin.H{
-		"list": list,
-		"page": page,
-	}, "获取每日更新成功", c)
+	dto.Success(result, "获取每日更新成功", c)
 }
 
-func parseDailyUpdatePage(c *gin.Context) *dto.Page {
-	pageRaw := strings.TrimSpace(c.Query("page"))
-	if pageRaw == "" {
-		pageRaw = strings.TrimSpace(c.Query("current"))
-	}
-	sizeRaw := strings.TrimSpace(c.Query("pageSize"))
-	if sizeRaw == "" {
-		sizeRaw = strings.TrimSpace(c.Query("size"))
-	}
-
-	// 如果没有显式传分页参数，返回 nil 保持兼容首页卡片
-	if pageRaw == "" && sizeRaw == "" {
-		return nil
-	}
-
-	current, _ := strconv.Atoi(pageRaw)
-	if current <= 0 {
-		current = 1
-	}
-	pageSize, _ := strconv.Atoi(sizeRaw)
-	if pageSize <= 0 {
-		// 若传了 limit，优先作为 pageSize
-		if limit, _ := strconv.Atoi(c.Query("limit")); limit > 0 {
-			pageSize = limit
-		} else {
-			pageSize = 20
+func queryFirst(c *gin.Context, keys ...string) string {
+	for _, key := range keys {
+		if v := strings.TrimSpace(c.Query(key)); v != "" {
+			return v
 		}
 	}
-	return &dto.Page{Current: current, PageSize: pageSize}
+	return ""
+}
+
+func parseQueryInt(raw string, fallback int) int {
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	return n
+}
+
+const (
+	hotKeywordsDefaultLimit = 8
+	hotKeywordsMaxLimit     = 20
+)
+
+func parseHotKeywordsLimit(raw string) int {
+	n := parseQueryInt(raw, hotKeywordsDefaultLimit)
+	if n <= 0 {
+		return hotKeywordsDefaultLimit
+	}
+	if n > hotKeywordsMaxLimit {
+		return hotKeywordsMaxLimit
+	}
+	return n
+}
+
+func parseQueryBool(raw string) bool {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	return raw == "1" || raw == "true"
+}
+
+func parseDailyUpdatePid(raw string) int64 {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 func parseDailyUpdateLimit(raw string) int {
@@ -240,15 +203,20 @@ func parseDailyUpdateLimit(raw string) int {
 	return n
 }
 
+const dailyUpdateExcludeCap = 500
+
 func parseDailyUpdateExclude(raw string) []int64 {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil
 	}
 	parts := strings.Split(raw, ",")
-	out := make([]int64, 0, len(parts))
-	seen := make(map[int64]struct{}, len(parts))
+	out := make([]int64, 0, min(len(parts), dailyUpdateExcludeCap))
+	seen := make(map[int64]struct{}, min(len(parts), dailyUpdateExcludeCap))
 	for _, part := range parts {
+		if len(out) >= dailyUpdateExcludeCap {
+			break
+		}
 		id, err := strconv.ParseInt(strings.TrimSpace(part), 10, 64)
 		if err != nil || id <= 0 {
 			continue
@@ -363,6 +331,13 @@ func (h *IndexHandler) SearchFilm(c *gin.Context) {
 	dto.Success(gin.H{"list": bl, "page": page}, "影片搜索成功", c)
 }
 
+// HotKeywords 获取当前全站热门搜索推荐词
+func (h *IndexHandler) HotKeywords(c *gin.Context) {
+	limit := parseHotKeywordsLimit(c.Query("limit"))
+	list := service.IndexSvc.GetHotSearchKeywords(limit)
+	dto.Success(list, "热门搜索获取成功", c)
+}
+
 // FilmTagSearch 通过tag获取满足条件的对应影片
 func (h *IndexHandler) FilmTagSearch(c *gin.Context) {
 	params := model.SearchTagsVO{}
@@ -382,7 +357,9 @@ func (h *IndexHandler) FilmTagSearch(c *gin.Context) {
 	params.Sort = c.DefaultQuery("Sort", "update_stamp")
 
 	page := dto.GetPageParams(c)
-	page.PageSize = 49
+	if c.Query("pageSize") == "" && c.Query("pagesize") == "" && c.Query("limit") == "" {
+		page.PageSize = 48
+	}
 
 	cat := service.IndexSvc.GetPidCategory(params.Pid)
 

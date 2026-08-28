@@ -185,6 +185,38 @@ function shuffleOrder(n: number) {
   return order;
 }
 
+/** Sattolo：无不动点的单循环，散开时每块都会离开原格 */
+function derangeOrder(n: number) {
+  const order = Array.from({ length: n }, (_, i) => i);
+  for (let i = n - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * i);
+    const tmp = order[i];
+    order[i] = order[j];
+    order[j] = tmp;
+  }
+  return order;
+}
+
+/** 散开目标改成随机格点，避免只抖动几像素仍能看出原图 */
+function scrambleSlotScatter(scraps: Scrap[], start: number) {
+  const n = scraps.length - start;
+  if (n < 2) {
+    return;
+  }
+  const homesX = new Array<number>(n);
+  const homesY = new Array<number>(n);
+  for (let i = 0; i < n; i += 1) {
+    homesX[i] = scraps[start + i].homeX;
+    homesY[i] = scraps[start + i].homeY;
+  }
+  const order = derangeOrder(n);
+  for (let i = 0; i < n; i += 1) {
+    const p = scraps[start + i];
+    p.wx = homesX[order[i]] - p.homeX;
+    p.wy = homesY[order[i]] - p.homeY;
+  }
+}
+
 function layout(p: Scrap, slot: DOMRect, stage: DOMRect) {
   p.w = p.uw * slot.width;
   p.h = p.uh * slot.height;
@@ -227,10 +259,10 @@ export function spawnScraps(slots: HTMLElement[], stage: DOMRect): Scrap[] {
     const block = compact ? PIXEL_COMPACT : PIXEL;
     const pix = pixelate(img, rect.width, rect.height, block);
     const pieces = splitPixels(rect.width, rect.height, compact, s === 0);
+    const start = out.length;
     for (let i = 0; i < pieces.length; i += 1) {
       const piece = pieces[i];
       const ang = Math.random() * Math.PI * 2;
-      const force = 2 + Math.random() * 4;
       const p: Scrap = {
         slotIndex: s,
         u: piece.x / rect.width,
@@ -251,8 +283,8 @@ export function spawnScraps(slots: HTMLElement[], stage: DOMRect): Scrap[] {
         boxT: 0,
         boxR: 0,
         boxB: 0,
-        wx: Math.cos(ang) * force,
-        wy: Math.sin(ang) * force,
+        wx: 0,
+        wy: 0,
         px: -Math.sin(ang),
         py: Math.cos(ang),
         delay: Math.random() * 0.08,
@@ -276,8 +308,73 @@ export function spawnScraps(slots: HTMLElement[], stage: DOMRect): Scrap[] {
       bindFromPixel(p, pix, img, "img");
       out.push(p);
     }
+    scrambleSlotScatter(out, start);
   }
   return out;
+}
+
+export function retargetSlotScraps(
+  scraps: Scrap[],
+  slotIndex: number,
+  slot: HTMLElement | null | undefined,
+  stage: DOMRect,
+  shuffle: boolean,
+) {
+  if (!slot) {
+    return;
+  }
+  const idxs: number[] = [];
+  for (let i = 0; i < scraps.length; i += 1) {
+    if (scraps[i].slotIndex === slotIndex) {
+      idxs.push(i);
+    }
+  }
+  if (idxs.length === 0) {
+    return;
+  }
+
+  const cells = idxs.map((i) => {
+    const p = scraps[i];
+    return { u: p.u, v: p.v, uw: p.uw, uh: p.uh };
+  });
+  const order = shuffle ? shuffleOrder(idxs.length) : idxs.map((_, i) => i);
+  const rect = slot.getBoundingClientRect();
+  const compact = stage.width < 720;
+  const block = compact ? PIXEL_COMPACT : PIXEL;
+  const nextImg = slotImage(slot);
+  const pix = nextImg ? pixelate(nextImg, rect.width, rect.height, block) : null;
+  for (let k = 0; k < idxs.length; k += 1) {
+    const p = scraps[idxs[k]];
+    const cell = cells[order[k]];
+    const hx = p.x;
+    const hy = p.y;
+    if (cell) {
+      p.u = cell.u;
+      p.v = cell.v;
+      p.uw = cell.uw;
+      p.uh = cell.uh;
+      p.boxL = rect.left - stage.left;
+      p.boxT = rect.top - stage.top;
+      p.boxR = p.boxL + rect.width;
+      p.boxB = p.boxT + rect.height;
+      p.homeW = p.uw * rect.width;
+      p.homeH = p.uh * rect.height;
+      p.w = p.homeW;
+      p.h = p.homeH;
+      p.homeX = p.boxL + (p.u + p.uw / 2) * rect.width;
+      p.homeY = p.boxT + (p.v + p.uh / 2) * rect.height;
+      if (nextImg) {
+        bindFromPixel(p, pix, nextImg, "alt");
+      }
+    }
+    p.x = hx;
+    p.y = hy;
+    p.mix = 0;
+    p.delay = Math.random() * 0.18;
+    clampInCard(p);
+    p.holdX = p.x;
+    p.holdY = p.y;
+  }
 }
 
 export function retargetScraps(
@@ -286,60 +383,12 @@ export function retargetScraps(
   stage: DOMRect,
   shuffle: boolean,
 ) {
-  const groups = new Map<number, number[]>();
+  const slotIndices = new Set<number>();
   for (let i = 0; i < scraps.length; i += 1) {
-    const list = groups.get(scraps[i].slotIndex) ?? [];
-    list.push(i);
-    groups.set(scraps[i].slotIndex, list);
+    slotIndices.add(scraps[i].slotIndex);
   }
-
-  groups.forEach((idxs) => {
-    const cells = idxs.map((i) => {
-      const p = scraps[i];
-      return { u: p.u, v: p.v, uw: p.uw, uh: p.uh };
-    });
-    const order = shuffle ? shuffleOrder(idxs.length) : idxs.map((_, i) => i);
-    const slot = slots[scraps[idxs[0]].slotIndex];
-    if (!slot) {
-      return;
-    }
-    const rect = slot.getBoundingClientRect();
-    const compact = stage.width < 720;
-    const block = compact ? PIXEL_COMPACT : PIXEL;
-    const nextImg = slotImage(slot);
-    const pix = nextImg ? pixelate(nextImg, rect.width, rect.height, block) : null;
-    for (let k = 0; k < idxs.length; k += 1) {
-      const p = scraps[idxs[k]];
-      const cell = cells[order[k]];
-      const hx = p.x;
-      const hy = p.y;
-      if (cell) {
-        p.u = cell.u;
-        p.v = cell.v;
-        p.uw = cell.uw;
-        p.uh = cell.uh;
-        p.boxL = rect.left - stage.left;
-        p.boxT = rect.top - stage.top;
-        p.boxR = p.boxL + rect.width;
-        p.boxB = p.boxT + rect.height;
-        p.homeW = p.uw * rect.width;
-        p.homeH = p.uh * rect.height;
-        p.w = p.homeW;
-        p.h = p.homeH;
-        p.homeX = p.boxL + (p.u + p.uw / 2) * rect.width;
-        p.homeY = p.boxT + (p.v + p.uh / 2) * rect.height;
-        if (nextImg) {
-          bindFromPixel(p, pix, nextImg, "alt");
-        }
-      }
-      p.x = hx;
-      p.y = hy;
-      p.mix = 0;
-      p.delay = Math.random() * 0.18;
-      clampInCard(p);
-      p.holdX = p.x;
-      p.holdY = p.y;
-    }
+  slotIndices.forEach((s) => {
+    retargetSlotScraps(scraps, s, slots[s], stage, shuffle);
   });
 }
 

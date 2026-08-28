@@ -4,11 +4,12 @@ import React, {
   Suspense,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
 } from "react";
 import { usePathname, useSearchParams } from "next/navigation";
-import { Button, Drawer, Empty, Input } from "antd";
+import { Drawer, Empty } from "antd";
 import {
   SearchOutlined,
   HistoryOutlined,
@@ -18,6 +19,9 @@ import {
   FireOutlined,
   DownOutlined,
   GithubOutlined,
+  SunOutlined,
+  MoonOutlined,
+  DesktopOutlined,
 } from "@ant-design/icons";
 import styles from "./index.module.less";
 import { useAppMessage } from "@/lib/useAppMessage";
@@ -26,6 +30,7 @@ import { clearHistoryMap, readHistoryMap } from "@/lib/historyStorage";
 import { usePublicContentLoading } from "@/components/public/PublicContentLoading";
 import SiteLogo from "@/components/public/SiteLogo";
 import { PROJECT_GITHUB_URL, DEFAULT_SITE_NAME } from "@/lib/project";
+import { useThemeMode } from "@/components/theme/GlobalThemeProvider";
 
 interface NavItem {
   id: string | number;
@@ -49,21 +54,20 @@ interface HistoryItem {
 function SearchParamsBridge({
   onChange,
 }: {
-  onChange: (next: { search: string; pid: string | null }) => void;
+  onChange: (next: { pid: string | null }) => void;
 }) {
   const searchParams = useSearchParams();
-  const search = searchParams.get("search") || "";
   const pid = searchParams.get("Pid");
 
   useEffect(() => {
-    onChange({ search, pid });
-  }, [search, pid, onChange]);
+    onChange({ pid });
+  }, [pid, onChange]);
 
   return null;
 }
 
 export default function Header({ navList }: { navList: NavItem[] }) {
-  const [keyword, setKeyword] = useState("");
+  const { mode, setMode } = useThemeMode();
   const { config: siteInfo } = useSiteConfig();
   const [historyList, setHistoryList] = useState<HistoryItem[]>([]);
   const [scrolled, setScrolled] = useState(false);
@@ -78,17 +82,16 @@ export default function Header({ navList }: { navList: NavItem[] }) {
   const pathname = usePathname();
   const { message } = useAppMessage();
   const desktopCatalogRef = useRef<HTMLDivElement>(null);
+  const navHomeRef = useRef<HTMLAnchorElement>(null);
+  const navCatalogRef = useRef<HTMLButtonElement>(null);
+  const navMeasureRef = useRef<HTMLDivElement>(null);
   const {
     navigate: layoutNavigate,
     active: contentLoadingActive,
   } = usePublicContentLoading();
 
-  const [keywordFromUrl, setKeywordFromUrl] = useState("");
-
   const onSearchParamsChange = useCallback(
-    (next: { search: string; pid: string | null }) => {
-      setKeyword(next.search);
-      setKeywordFromUrl(next.search);
+    (next: { pid: string | null }) => {
       setUrlPid(next.pid);
     },
     [],
@@ -123,25 +126,13 @@ export default function Header({ navList }: { navList: NavItem[] }) {
     message.success("已清空历史记录");
   };
 
-  const handleSearch = () => {
-    const q = keyword.trim();
-    if (!q) {
-      message.error("请输入搜索关键词");
-      return;
-    }
-    const href = `/search?search=${encodeURIComponent(q)}`;
-    // 同 keyword 且已在搜索页：不重复导航
-    if (pathname === "/search" && keywordFromUrl === q) {
-      return;
-    }
-    beginHeaderNavigation("search", "搜索加载中...", href);
-  };
-
   const [showHistory, setShowHistory] = useState(false);
   const historyRef = useRef<HTMLDivElement>(null);
   const quickNavs = navList.slice(0, QUICK_NAV_LIMIT);
+  const [visibleQuickCount, setVisibleQuickCount] = useState(quickNavs.length);
   const activePid = pathname.startsWith("/filmClassify") ? urlPid : null;
   const isHomeActive = pathname === "/";
+  const isSearchActive = pathname === "/search";
   const isCategoryActive = (id: string | number) => activeCategoryId === String(id);
 
   // 导航进行中保持乐观高亮，避免 URL 尚未更新时被 activePid 冲掉
@@ -177,6 +168,60 @@ export default function Header({ navList }: { navList: NavItem[] }) {
     document.addEventListener("keydown", handleEscape);
     return () => document.removeEventListener("keydown", handleEscape);
   }, []);
+
+  const quickNavSignature = quickNavs.map((nav) => `${nav.id}:${nav.name}`).join("|");
+
+  useLayoutEffect(() => {
+    const area = desktopCatalogRef.current;
+    const home = navHomeRef.current;
+    const catalog = navCatalogRef.current;
+    const measure = navMeasureRef.current;
+    if (!area || !home || !catalog || !measure) {
+      return;
+    }
+
+    let cancelled = false;
+    const relayout = () => {
+      if (cancelled) {
+        return;
+      }
+      const items = Array.from(measure.children) as HTMLElement[];
+      const scrollerGap = parseFloat(getComputedStyle(measure).gap) || 10;
+      const links = home.parentElement;
+      const linksGap = links ? parseFloat(getComputedStyle(links).gap) || 14 : 14;
+      const available = Math.max(
+        0,
+        area.clientWidth - home.offsetWidth - catalog.offsetWidth - linksGap * 2,
+      );
+
+      let used = 0;
+      let count = 0;
+      for (const item of items) {
+        const width = item.offsetWidth;
+        if (width <= 0) {
+          continue;
+        }
+        const next = count === 0 ? width : used + scrollerGap + width;
+        if (next > available - 1) {
+          break;
+        }
+        used = next;
+        count += 1;
+      }
+
+      setVisibleQuickCount((prev) => (prev === count ? prev : count));
+    };
+
+    relayout();
+    const observer = new ResizeObserver(relayout);
+    observer.observe(area);
+    observer.observe(measure);
+    document.fonts?.ready?.then(relayout);
+    return () => {
+      cancelled = true;
+      observer.disconnect();
+    };
+  }, [quickNavSignature]);
 
   const toggleHistory = () => {
     const nextShow = !showHistory;
@@ -230,6 +275,17 @@ export default function Header({ navList }: { navList: NavItem[] }) {
     }
     setActiveCategoryId("");
     beginHeaderNavigation("home", "首页加载中...", "/");
+  };
+
+  const navigateToSearch = () => {
+    if (pathname === "/search") {
+      window.dispatchEvent(new Event("ecohub:focus-search"));
+      return;
+    }
+    if (isNavigating && pendingCategoryId === "search") {
+      return;
+    }
+    beginHeaderNavigation("search", "搜索加载中...", "/search");
   };
 
   /** Logo 点击：优先跳转网站配置的 siteUrl，否则回前台首页 */
@@ -309,11 +365,17 @@ export default function Header({ navList }: { navList: NavItem[] }) {
         <div className={styles.headerInner}>
           {/* LOGO Area：稳定挂载，导航时不 remount */}
           <div className={styles.logoArea}>
-            <div className={styles.mobileMenuTrigger} onClick={() => setMobileMenuVisible(true)}>
+            <button
+              type="button"
+              className={styles.mobileMenuTrigger}
+              onClick={() => setMobileMenuVisible(true)}
+              aria-label="打开导航菜单"
+            >
               <MenuOutlined />
-            </div>
+            </button>
             
-            <div
+            <button
+              type="button"
               className={styles.siteName}
               onClick={navigateFromLogo}
               title={siteInfo?.siteUrl ? `打开 ${siteInfo.siteUrl}` : "回首页"}
@@ -324,13 +386,21 @@ export default function Header({ navList }: { navList: NavItem[] }) {
                 fetchPriority="high"
               />
               <span className={styles.logoText}>{siteInfo?.siteName || DEFAULT_SITE_NAME}</span>
-            </div>
+            </button>
           </div>
 
           {/* Navigation Area - Dynamic & Flexible */}
           <div className={styles.navArea} ref={desktopCatalogRef}>
+            <div className={styles.navMeasure} ref={navMeasureRef} aria-hidden="true">
+              {quickNavs.map((nav) => (
+                <span key={nav.id} className={styles.navItem}>
+                  {nav.name}
+                </span>
+              ))}
+            </div>
             <nav className={styles.navLinks}>
               <a
+                ref={navHomeRef}
                 onClick={navigateToHome}
                 className={`${styles.navHomeItem} ${isHomeActive ? styles.navHomeItemActive : ""}`}
               >
@@ -338,7 +408,7 @@ export default function Header({ navList }: { navList: NavItem[] }) {
               </a>
 
               <div className={styles.navScroller}>
-                {quickNavs.map((nav) => {
+                {quickNavs.slice(0, visibleQuickCount).map((nav) => {
                   const isActive = isCategoryActive(nav.id);
                   return (
                     <a
@@ -353,6 +423,7 @@ export default function Header({ navList }: { navList: NavItem[] }) {
               </div>
 
               <button
+                ref={navCatalogRef}
                 type="button"
                 className={`${styles.navCatalogBtn} ${desktopCatalogOpen ? styles.navCatalogBtnActive : ""}`}
                 onClick={() => setDesktopCatalogOpen((open) => !open)}
@@ -390,22 +461,6 @@ export default function Header({ navList }: { navList: NavItem[] }) {
 
           {/* Action Area - Search & Actions */}
           <div className={styles.actionArea}>
-            <div className={styles.searchGroup}>
-              <Input
-                placeholder="搜索影片、动漫..."
-                value={keyword}
-                onChange={(e) => setKeyword(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && handleSearch()}
-                variant="borderless"
-              />
-              <Button 
-                type="primary" 
-                icon={<SearchOutlined />} 
-                className={styles.searchBtn}
-                onClick={handleSearch}
-              />
-            </div>
-
             <div className={styles.actions}>
               <a
                 href={PROJECT_GITHUB_URL}
@@ -418,23 +473,26 @@ export default function Header({ navList }: { navList: NavItem[] }) {
                 <GithubOutlined />
               </a>
               <div className={styles.historyWrapper} ref={historyRef}>
-                <div 
-                  className={`${styles.actionBtn} ${showHistory ? styles.active : ""}`} 
+                <button
+                  type="button"
+                  className={`${styles.actionBtn} ${showHistory ? styles.active : ""}`}
                   onClick={toggleHistory}
+                  title="历史记录"
+                  aria-label="打开历史记录"
                 >
                   <HistoryOutlined />
-                </div>
+                </button>
                 {historyContent}
               </div>
-              
-              <div
-                className={styles.mobileSearchBtn}
-                onClick={() => {
-                  beginHeaderNavigation("search", "搜索加载中...", "/search");
-                }}
+              <button
+                type="button"
+                className={`${styles.actionBtn} ${isSearchActive ? styles.active : ""}`}
+                onClick={navigateToSearch}
+                title="搜索"
+                aria-label="打开搜索页"
               >
                 <SearchOutlined />
-              </div>
+              </button>
             </div>
           </div>
         </div>
@@ -445,36 +503,58 @@ export default function Header({ navList }: { navList: NavItem[] }) {
           onClose={() => setMobileMenuVisible(false)}
           open={mobileMenuVisible}
           size={280}
+          zIndex={1300}
           className={styles.mobileDrawer}
         >
-          <div className={styles.mobileNav}>
-            <div
-              className={`${styles.mobileNavItem} ${isHomeActive ? styles.mobileNavItemActive : ""}`}
-              onClick={navigateToHome}
-            >
-              <HomeOutlined /> <span>首页</span>
+          <div className={styles.mobileDrawerBody}>
+            <div className={styles.mobileNav}>
+              <div
+                className={`${styles.mobileNavItem} ${isHomeActive ? styles.mobileNavItemActive : ""}`}
+                onClick={navigateToHome}
+              >
+                <HomeOutlined /> <span>首页</span>
+              </div>
+              {navList.map((nav) => {
+                const isActive = isCategoryActive(nav.id);
+                return (
+                  <div 
+                    key={nav.id} 
+                    className={`${styles.mobileNavItem} ${isActive ? styles.mobileNavItemActive : ""}`}
+                    onClick={() => navigateToCategory(nav.id)}
+                  >
+                    <FireOutlined /> <span>{nav.name}</span>
+                  </div>
+                );
+              })}
             </div>
-            {navList.map((nav) => {
-              const isActive = isCategoryActive(nav.id);
-              return (
-                <div 
-                  key={nav.id} 
-                  className={`${styles.mobileNavItem} ${isActive ? styles.mobileNavItemActive : ""}`}
-                  onClick={() => navigateToCategory(nav.id)}
+
+            {/* 移动端抽屉底部：主题外观切换 */}
+            <div className={styles.mobileThemeSection}>
+              <div className={styles.mobileThemeLabel}>外观模式</div>
+              <div className={styles.mobileThemeSegment}>
+                <button
+                  type="button"
+                  className={`${styles.themeOptionBtn} ${mode === "light" ? styles.themeOptionActive : ""}`}
+                  onClick={() => setMode("light")}
                 >
-                  <FireOutlined /> <span>{nav.name}</span>
-                </div>
-              );
-            })}
-            <a
-              href={PROJECT_GITHUB_URL}
-              target="_blank"
-              rel="noopener noreferrer"
-              className={styles.mobileNavItem}
-              title="打开 GitHub 项目地址"
-            >
-              <GithubOutlined /> <span>GitHub 项目地址</span>
-            </a>
+                  <SunOutlined /> <span>浅色</span>
+                </button>
+                <button
+                  type="button"
+                  className={`${styles.themeOptionBtn} ${mode === "dark" ? styles.themeOptionActive : ""}`}
+                  onClick={() => setMode("dark")}
+                >
+                  <MoonOutlined /> <span>深色</span>
+                </button>
+                <button
+                  type="button"
+                  className={`${styles.themeOptionBtn} ${mode === "system" ? styles.themeOptionActive : ""}`}
+                  onClick={() => setMode("system")}
+                >
+                  <DesktopOutlined /> <span>系统</span>
+                </button>
+              </div>
+            </div>
           </div>
         </Drawer>
       </header>
