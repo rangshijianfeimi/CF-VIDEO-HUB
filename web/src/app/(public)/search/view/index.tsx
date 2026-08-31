@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { Button, Pagination } from "antd";
 import {
   AppstoreOutlined,
@@ -19,6 +19,7 @@ import { FALLBACK_IMG } from "@/lib/fallbackImg";
 import { resolvePlayEntryPath } from "@/lib/playNavigation";
 import { useContentNavigate } from "@/components/public/PublicContentLoading";
 import FilmList from "@/components/public/FilmList";
+import HighlightMatchedText from "@/components/public/HighlightMatchedText";
 import styles from "./index.module.less";
 
 const HOT_KEYWORDS = [
@@ -65,6 +66,8 @@ function getPrimaryPlotTag(classTag?: string) {
   );
 }
 
+const EMPTY_HISTORY_LIST: string[] = [];
+
 function getInitialHistory(): string[] {
   if (typeof window === "undefined") return [];
   try {
@@ -79,34 +82,80 @@ function getInitialHistory(): string[] {
   return [];
 }
 
-function getInitialViewMode(): "grid" | "detail" {
-  if (typeof window === "undefined") return "grid";
-  try {
-    const stored = localStorage.getItem(SEARCH_VIEW_MODE_KEY);
-    if (stored === "grid" || stored === "detail") {
-      return stored;
-    }
-  } catch {}
-  return "grid";
+function subscribeHistory(callback: () => void) {
+  if (typeof window === "undefined") return () => {};
+  window.addEventListener("storage", callback);
+  window.addEventListener("ecohub:search-history", callback);
+  return () => {
+    window.removeEventListener("storage", callback);
+    window.removeEventListener("ecohub:search-history", callback);
+  };
 }
+
+function getHistorySnapshot(): string {
+  if (typeof window === "undefined") return "[]";
+  return localStorage.getItem(SEARCH_HISTORY_KEY) || "[]";
+}
+
+function subscribeViewMode(callback: () => void) {
+  if (typeof window === "undefined") return () => {};
+  window.addEventListener("storage", callback);
+  window.addEventListener("ecohub:search-view-mode", callback);
+  return () => {
+    window.removeEventListener("storage", callback);
+    window.removeEventListener("ecohub:search-view-mode", callback);
+  };
+}
+
+function getViewModeSnapshot(): "grid" | "detail" {
+  if (typeof window === "undefined") return "grid";
+  const stored = localStorage.getItem(SEARCH_VIEW_MODE_KEY);
+  return stored === "detail" ? "detail" : "grid";
+}
+
+const SORT_OPTIONS = [
+  { key: "", label: "综合相关度" },
+  { key: "hits", label: "最多播放" },
+  { key: "latest", label: "最近更新" },
+  { key: "score", label: "最高评分" },
+  { key: "year", label: "上映年份" },
+];
 
 export default function SearchPageView({
   data,
   keyword,
   current,
+  sort = "",
   hotKeywords = [],
 }: {
   data: any;
   keyword: string;
   current: string;
+  sort?: string;
   hotKeywords?: string[];
 }) {
   const { navigate, isNavigating } = useContentNavigate();
   const { message } = useAppMessage();
   const inputRef = useRef<HTMLInputElement>(null);
   const [searchKeyword, setSearchKeyword] = useState(keyword);
-  const [history, setHistory] = useState<string[]>([]);
-  const [viewMode, setViewMode] = useState<"grid" | "detail">("grid");
+  const [prevParamsKey, setPrevParamsKey] = useState(`${keyword}:${current}:${sort}`);
+
+  if (prevParamsKey !== `${keyword}:${current}:${sort}`) {
+    setPrevParamsKey(`${keyword}:${current}:${sort}`);
+    setSearchKeyword(keyword);
+  }
+
+  const rawHistory = useSyncExternalStore(subscribeHistory, getHistorySnapshot, () => "[]");
+  const history = useMemo(() => {
+    try {
+      const parsed = JSON.parse(rawHistory);
+      return Array.isArray(parsed) ? parsed.slice(0, 8) : EMPTY_HISTORY_LIST;
+    } catch {
+      return EMPTY_HISTORY_LIST;
+    }
+  }, [rawHistory]);
+
+  const viewMode = useSyncExternalStore(subscribeViewMode, getViewModeSnapshot, () => "grid");
 
   useEffect(() => {
     const onFocusSearch = () => {
@@ -142,21 +191,6 @@ export default function SearchPageView({
   }, [isNavigating, keyword]);
 
   useEffect(() => {
-    setHistory(getInitialHistory());
-    setViewMode(getInitialViewMode());
-    const handleStorage = () => {
-      setHistory(getInitialHistory());
-    };
-    window.addEventListener("storage", handleStorage);
-    window.addEventListener("ecohub:search-history", handleStorage);
-    return () => {
-      window.removeEventListener("storage", handleStorage);
-      window.removeEventListener("ecohub:search-history", handleStorage);
-    };
-  }, []);
-
-  useEffect(() => {
-    setSearchKeyword(keyword);
     const trimmed = keyword.trim();
     if (!trimmed) return;
     const currentList = getInitialHistory();
@@ -164,9 +198,9 @@ export default function SearchPageView({
       trimmed,
       ...currentList.filter((item) => item !== trimmed),
     ].slice(0, 8);
-    setHistory(nextHistory);
     try {
       localStorage.setItem(SEARCH_HISTORY_KEY, JSON.stringify(nextHistory));
+      window.dispatchEvent(new Event("ecohub:search-history"));
     } catch {}
   }, [keyword]);
 
@@ -178,7 +212,6 @@ export default function SearchPageView({
       trimmed,
       ...currentList.filter((item) => item !== trimmed),
     ].slice(0, 8);
-    setHistory(nextHistory);
     try {
       localStorage.setItem(SEARCH_HISTORY_KEY, JSON.stringify(nextHistory));
       window.dispatchEvent(new Event("ecohub:search-history"));
@@ -188,7 +221,6 @@ export default function SearchPageView({
   const removeHistoryItem = (target: string) => {
     const currentList = getInitialHistory();
     const nextHistory = currentList.filter((item) => item !== target);
-    setHistory(nextHistory);
     try {
       localStorage.setItem(SEARCH_HISTORY_KEY, JSON.stringify(nextHistory));
       window.dispatchEvent(new Event("ecohub:search-history"));
@@ -196,7 +228,6 @@ export default function SearchPageView({
   };
 
   const clearHistory = () => {
-    setHistory([]);
     try {
       localStorage.removeItem(SEARCH_HISTORY_KEY);
       window.dispatchEvent(new Event("ecohub:search-history"));
@@ -209,16 +240,27 @@ export default function SearchPageView({
       message.warning("请输入搜索关键词");
       return;
     }
+    setSearchKeyword(trimmed);
     saveHistory(trimmed);
     navigate(
-      `/search?search=${encodeURIComponent(trimmed)}&current=1`,
+      `/search?search=${encodeURIComponent(trimmed)}&sort=${encodeURIComponent(sort)}&current=1`,
       "搜索加载中...",
     );
   };
 
-  const handlePageChange = (page: number) => {
+  const handleSortChange = (newSort: string) => {
+    if (newSort === sort) return;
+    setSearchKeyword(keyword);
     navigate(
-      `/search?search=${encodeURIComponent(keyword)}&current=${page}`,
+      `/search?search=${encodeURIComponent(keyword)}&sort=${encodeURIComponent(newSort)}&current=1`,
+      "排序切换中...",
+    );
+  };
+
+  const handlePageChange = (page: number) => {
+    setSearchKeyword(keyword);
+    navigate(
+      `/search?search=${encodeURIComponent(keyword)}&sort=${encodeURIComponent(sort)}&current=${page}`,
       "页面加载中...",
     );
   };
@@ -231,9 +273,9 @@ export default function SearchPageView({
   };
 
   const toggleViewMode = (mode: "grid" | "detail") => {
-    setViewMode(mode);
     try {
       localStorage.setItem(SEARCH_VIEW_MODE_KEY, mode);
+      window.dispatchEvent(new Event("ecohub:search-view-mode"));
     } catch {}
   };
 
@@ -252,7 +294,7 @@ export default function SearchPageView({
           <input
             ref={inputRef}
             type="text"
-            placeholder="搜索电影、剧集、动漫、综艺..."
+            placeholder="搜索电影、剧集、动漫、综艺、主演、导演..."
             value={searchKeyword}
             onChange={(e) => setSearchKeyword(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && executeSearch(searchKeyword)}
@@ -319,6 +361,26 @@ export default function SearchPageView({
           </div>
         )}
       </header>
+
+      {/* YouTube 风格排序筛选栏 */}
+      {keyword && (
+        <div className={styles.sortBar} aria-label="排序方式">
+          {SORT_OPTIONS.map((opt) => {
+            const isActive = (opt.key === "" && (!sort || sort === "relevance")) || opt.key === sort;
+            return (
+              <button
+                type="button"
+                key={opt.key}
+                className={`${styles.sortChip} ${isActive ? styles.active : ""}`}
+                aria-pressed={isActive}
+                onClick={() => handleSortChange(opt.key)}
+              >
+                {opt.label}
+              </button>
+            );
+          })}
+        </div>
+      )}
 
       {/* 快捷推荐与历史栏（常驻展示） */}
       <section className={styles.quickBar}>
@@ -391,7 +453,7 @@ export default function SearchPageView({
           {/* 模式 A：海报瀑布流网格 */}
           {viewMode === "grid" ? (
             <div className={styles.gridContainer}>
-              <FilmList list={data.list} col={6} />
+              <FilmList list={data.list} col={6} highlightQuery={keyword} />
             </div>
           ) : (
             /* 模式 B：图文详情卡片 */
@@ -419,7 +481,11 @@ export default function SearchPageView({
                       className={styles.filmName}
                       onClick={() => handlePlay(movie.id)}
                     >
-                      {movie.name}
+                      <HighlightMatchedText
+                        text={movie.name}
+                        query={keyword}
+                        className={styles.highlightMatched}
+                      />
                     </h3>
 
                     <div className={styles.tags}>
@@ -453,14 +519,30 @@ export default function SearchPageView({
                     <div className={styles.metaRow}>
                       <span className={styles.metaLabel}>导演</span>
                       <span className={styles.metaValue}>
-                        {movie.director || "暂无导演信息"}
+                        {movie.director ? (
+                          <HighlightMatchedText
+                            text={movie.director}
+                            query={keyword}
+                            className={styles.highlightMatched}
+                          />
+                        ) : (
+                          "暂无导演信息"
+                        )}
                       </span>
                     </div>
 
                     <div className={styles.metaRow}>
                       <span className={styles.metaLabel}>主演</span>
                       <span className={styles.metaValue}>
-                        {movie.actor || "暂无主演信息"}
+                        {movie.actor ? (
+                          <HighlightMatchedText
+                            text={movie.actor}
+                            query={keyword}
+                            className={styles.highlightMatched}
+                          />
+                        ) : (
+                          "暂无主演信息"
+                        )}
                       </span>
                     </div>
 
@@ -489,7 +571,7 @@ export default function SearchPageView({
             <Pagination
               current={parseInt(current || "1", 10)}
               total={data.page?.total ?? totalCount}
-              pageSize={data.page?.pageSize || 20}
+              pageSize={data.page?.pageSize || 12}
               onChange={handlePageChange}
               showSizeChanger={false}
               hideOnSinglePage
