@@ -99,6 +99,11 @@ export default function SourceFormModal(props: SourceFormModalProps) {
               { label: "主采集站", value: 0 },
               { label: "附属采集站", value: 1 },
             ]}
+            onChange={(e) => {
+              if (e.target.value === 0) {
+                form.setFieldValue("isPosterSource", true);
+              }
+            }}
           />
         </Form.Item>
         <Form.Item
@@ -118,6 +123,14 @@ export default function SourceFormModal(props: SourceFormModalProps) {
           <Select
             options={collectDuration.map((item) => ({ label: item.label, value: item.time }))}
           />
+        </Form.Item>
+        <Form.Item
+          label="海报图源"
+          name="isPosterSource"
+          valuePropName="checked"
+          tooltip="采集时用其高清海报填充主站对应影片（全局唯一，关闭自动回退主站）。"
+        >
+          <Switch checkedChildren="开启" unCheckedChildren="关闭" />
         </Form.Item>
         <Form.Item label="是否启用" name="state" valuePropName="checked">
           <Switch checkedChildren="启用" unCheckedChildren="禁用" />

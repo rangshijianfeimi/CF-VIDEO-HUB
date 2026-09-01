@@ -45,7 +45,19 @@ func resolveProvideBaseURL(c *gin.Context) (string, error) {
 	return "", errors.New("无法解析当前请求域名，请检查反向代理 Host/X-Forwarded-Host 配置")
 }
 
-// HandleProvide 提供给外界采集的 MacCMS 兼容接口
+func normalizeMediaURL(raw, baseURL string) string {
+	if raw == "" || baseURL == "" {
+		return raw
+	}
+	if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
+		return raw
+	}
+	if strings.HasPrefix(raw, "/") {
+		return baseURL + raw
+	}
+	return baseURL + "/" + raw
+}
+
 func (h *ProvideHandler) HandleProvide(c *gin.Context) {
 	ac := c.Query("ac")
 	t, _ := strconv.Atoi(c.DefaultQuery("t", "0"))
@@ -94,6 +106,28 @@ func (h *ProvideHandler) HandleProvide(c *gin.Context) {
 		t = int(classList[0].ID)
 	}
 
+	baseURL, _ := resolveProvideBaseURL(c)
+
+	normalizeVodListPic := func(list []model.FilmList) []model.FilmList {
+		if baseURL == "" {
+			return list
+		}
+		for i := range list {
+			list[i].VodPic = normalizeMediaURL(list[i].VodPic, baseURL)
+		}
+		return list
+	}
+
+	normalizeDetailListPic := func(list []model.FilmDetail) []model.FilmDetail {
+		if baseURL == "" {
+			return list
+		}
+		for i := range list {
+			list[i].VodPic = normalizeMediaURL(list[i].VodPic, baseURL)
+		}
+		return list
+	}
+
 	switch ac {
 	case "list":
 		page, pagecount, total, vodList, err := service.ProvideSvc.GetVodList(t, cid, pg, wd, h_param, year, area, lang, plot, sort, limit)
@@ -112,7 +146,7 @@ func (h *ProvideHandler) HandleProvide(c *gin.Context) {
 			"limit":       limit,
 			"total":       total,
 			"recordcount": total,
-			"list":        vodList,
+			"list":        normalizeVodListPic(vodList),
 			"class":       classList,
 			"filters":     filters,
 		})
@@ -131,7 +165,7 @@ func (h *ProvideHandler) HandleProvide(c *gin.Context) {
 				"pagecount": 1,
 				"limit":     "20",
 				"total":     len(vodList),
-				"list":      vodList,
+				"list":      normalizeDetailListPic(vodList),
 				"class":     classList,
 				"filters":   filters,
 			})
@@ -157,7 +191,7 @@ func (h *ProvideHandler) HandleProvide(c *gin.Context) {
 				"limit":       limit,
 				"total":       total,
 				"recordcount": total,
-				"list":        detailList,
+				"list":        normalizeDetailListPic(detailList),
 				"class":       classList,
 				"filters":     filters,
 			})
@@ -180,7 +214,7 @@ func (h *ProvideHandler) HandleProvide(c *gin.Context) {
 			"limit":       limit,
 			"total":       total,
 			"recordcount": total,
-			"list":        vodList,
+			"list":        normalizeVodListPic(vodList),
 			"class":       classList,
 			"filters":     filters,
 		})

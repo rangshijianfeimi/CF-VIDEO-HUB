@@ -44,19 +44,16 @@ Read-only demo account: `guest` / `guest`. This account cannot save settings. Fo
 
 ### Server
 
-[CloudCone](https://app.cloudcone.com/?ref=14393) hosts the demonstration site and does **not throttle disk I/O**. Many low-cost VPS plans impose I/O limits, which can stall the database and collect jobs. Overseas instances do not require ICP filing and are available immediately after provisioning. They are suitable for collect workloads, deployments of this kind, and a self-hosted network egress.
+| Provider | Description | Link |
+| --- | --- | --- |
+| CloudCone | 1. Host of the demonstration site<br>2. Affordable VPS with unthrottled disk I/O | [Visit](https://app.cloudcone.com/?ref=14393) |
 
-### Proxy service
+### Network Service
 
-A stable network proxy is typically required when deploying overseas hosts, reaching collect sources, or debugging APIs. **LiangXinYun** is a direct-connect option:
-
-- **¥2 / month for 100G**, ¥6 for 1000G (1T)
-- Direct AWS and Oracle nodes; VLESS Reality and Hysteria2
-- Netflix, Disney+, TikTok, and ChatGPT unblocked; no traffic audit; 1× multiplier
-- Coverage includes Xinjiang, Henan, and Fujian; 4K playback during peak hours
-- New registrations receive trial traffic
-
-[Register LiangXinYun](https://xn--9kqz23b19z.com/#/register?code=xAmvfdic)
+| Provider | Features / Price | Link |
+| --- | --- | --- |
+| LiangXinYun | 1. ¥2/mo for 100G, ¥6 for 1000G (1T)<br>2. Direct AWS/Oracle (VLESS Reality & Hysteria2)<br>3. Unblock Netflix, Disney+, TikTok, ChatGPT; 1× multiplier<br>4. 4K smooth playback during peak hours<br>5. Free trial traffic for new users | [Register](https://xn--9kqz23b19z.com/#/register?code=xAmvfdic) |
+| PeiQian Airport | 1. As low as ¥1.5/mo, ultra-low price with huge traffic quota<br>2. Direct multi-protocol (VLESS, Hysteria 2, Shadowsocks)<br>3. Nodes in Hong Kong, Japan, Taiwan, Singapore, US, etc.<br>4. Low-multiplier download nodes for backup & heavy traffic | [Register](https://xn--mes358aby2apfg.com/register?code=FA4xlzHD&cover=sfw) |
 
 ## Quick start
 
@@ -126,4 +123,4 @@ Public site: `http://127.0.0.1:3000`. Administration panel: `/manage`. API: `htt
 
 ---
 
-[MIT](../LICENSE) · [fe-spark/EcoHub](https://github.com/fe-spark/EcoHub) · [Issues](https://github.com/fe-spark/EcoHub/issues) · [Telegram Group](https://t.me/+6O6MiUdVSOplNjQ0)
+[PolyForm Noncommercial 1.0.0](../LICENSE) · [fe-spark/EcoHub](https://github.com/fe-spark/EcoHub) · [Issues](https://github.com/fe-spark/EcoHub/issues) · [Telegram Group](https://t.me/+6O6MiUdVSOplNjQ0)

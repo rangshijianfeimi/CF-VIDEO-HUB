@@ -13,6 +13,7 @@ import (
 	"server/internal/infra/db"
 	"server/internal/model"
 	"server/internal/model/dto"
+	"server/internal/repository/support"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -50,11 +51,18 @@ func SetActiveSnapshotVersion(version string) error {
 }
 
 func GetActiveReadModelVersion() string {
-	readModel := GetActiveFilmReadModel()
-	if readModel == nil {
-		return GetActiveSnapshotVersion()
+	return activeReadModelVersion(GetActiveFilmReadModel(), GetActiveSnapshotVersion())
+}
+
+// activeReadModelVersion 取内存读模型版本；空指针或 Version 为空时回退到活跃快照版本。
+// ClearActiveFilmReadModel / init 都会写入 Version="" 的非空指针，不能把非空指针当成有效版本。
+func activeReadModelVersion(readModel *FilmReadModel, snapshotVersion string) string {
+	if readModel != nil {
+		if version := strings.TrimSpace(readModel.Version); version != "" {
+			return version
+		}
 	}
-	return readModel.Version
+	return snapshotVersion
 }
 
 func NewSnapshotVersion() string {
@@ -68,49 +76,47 @@ func RebuildFilmListSnapshot(version string) error {
 	}
 
 	startedAt := time.Now()
-	return db.Mdb.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("snapshot_version = ?", version).Unscoped().Delete(&model.FilmListSnapshot{}).Error; err != nil {
+	if err := db.Mdb.Where("snapshot_version = ?", version).Unscoped().Delete(&model.FilmListSnapshot{}).Error; err != nil {
+		return err
+	}
+
+	var lastID uint
+	total := 0
+	for {
+		batchStartedAt := time.Now()
+		var indexes []model.FilmIndex
+		if err := db.Mdb.Joins("JOIN "+model.TableMovieDetail+" ON "+model.TableMovieDetail+".mid = film_index.mid AND "+model.TableMovieDetail+".deleted_at IS NULL").
+			Where("film_index.id > ?", lastID).
+			Order("film_index.id ASC").
+			Limit(snapshotBuildBatchSize).
+			Find(&indexes).Error; err != nil {
 			return err
 		}
-
-		var lastID uint
-		total := 0
-		for {
-			batchStartedAt := time.Now()
-			var indexes []model.FilmIndex
-			if err := tx.Joins("JOIN "+model.TableMovieDetail+" ON "+model.TableMovieDetail+".mid = film_index.mid AND "+model.TableMovieDetail+".deleted_at IS NULL").
-				Where("film_index.id > ?", lastID).
-				Order("film_index.id ASC").
-				Limit(snapshotBuildBatchSize).
-				Find(&indexes).Error; err != nil {
-				return err
-			}
-			if len(indexes) == 0 {
-				break
-			}
-
-			snapshots := make([]model.FilmListSnapshot, 0, len(indexes))
-			for _, index := range indexes {
-				snapshots = append(snapshots, buildFilmListSnapshot(version, index))
-				lastID = index.ID
-			}
-			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(snapshots, snapshotBuildBatchSize).Error; err != nil {
-				return err
-			}
-			total += len(snapshots)
-			log.Printf(
-				"[Snapshot] 构建进度 version=%s total=%d batch=%d last_id=%d cost=%s total_cost=%s",
-				version,
-				total,
-				len(snapshots),
-				lastID,
-				time.Since(batchStartedAt),
-				time.Since(startedAt),
-			)
+		if len(indexes) == 0 {
+			break
 		}
 
-		return nil
-	})
+		snapshots := make([]model.FilmListSnapshot, 0, len(indexes))
+		for _, index := range indexes {
+			snapshots = append(snapshots, buildFilmListSnapshot(version, index))
+			lastID = index.ID
+		}
+		if err := db.Mdb.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(snapshots, snapshotBuildBatchSize).Error; err != nil {
+			return err
+		}
+		total += len(snapshots)
+		log.Printf(
+			"[Snapshot] 构建进度 version=%s total=%d batch=%d last_id=%d cost=%s total_cost=%s",
+			version,
+			total,
+			len(snapshots),
+			lastID,
+			time.Since(batchStartedAt),
+			time.Since(startedAt),
+		)
+	}
+
+	return nil
 }
 
 func ActivateRebuiltFilmListSnapshot(version string) error {
@@ -182,8 +188,17 @@ func pruneOldFilmListSnapshots(retain int) {
 		return
 	}
 
-	if err := db.Mdb.Where("snapshot_version NOT IN ?", versions).Unscoped().Delete(&model.FilmListSnapshot{}).Error; err != nil {
-		log.Printf("pruneOldFilmListSnapshots Delete Error: %v", err)
+	// 20w+ 数据量下分批删除旧快照数据，避免单次 DELETE 锁住全表与撑爆 Undo Log
+	const pruneChunkSize = 5000
+	for {
+		res := db.Mdb.Where("snapshot_version NOT IN ?", versions).Limit(pruneChunkSize).Unscoped().Delete(&model.FilmListSnapshot{})
+		if res.Error != nil {
+			log.Printf("pruneOldFilmListSnapshots Delete Error: %v", res.Error)
+			break
+		}
+		if res.RowsAffected == 0 {
+			break
+		}
 	}
 }
 
@@ -261,15 +276,18 @@ func buildFilmListSnapshot(version string, index model.FilmIndex) model.FilmList
 		Hits:             index.Hits,
 		State:            index.State,
 		Remarks:          index.Remarks,
-		Picture:          index.Picture,
-		PictureSlide:     index.PictureSlide,
-		Actor:            index.Actor,
-		Director:         index.Director,
-		Blurb:            index.Blurb,
-		CollectStamp:     index.CollectStamp,
-		CategoryVersion:  index.CategoryVersion,
-		RuleVersion:      index.RuleVersion,
-		PlayFromSummary:  index.PlayFromSummary,
+		Picture:            index.Picture,
+		PictureSlide:       index.PictureSlide,
+		CustomPicture:      index.CustomPicture,
+		CustomPictureSlide: index.CustomPictureSlide,
+		IsCustomPicture:    index.IsCustomPicture,
+		Actor:              index.Actor,
+		Director:           index.Director,
+		Blurb:              index.Blurb,
+		CollectStamp:       index.CollectStamp,
+		CategoryVersion:    index.CategoryVersion,
+		RuleVersion:        index.RuleVersion,
+		PlayFromSummary:    index.PlayFromSummary,
 	}
 }
 
@@ -299,8 +317,7 @@ func DeleteActiveSnapshotsByMids(mids ...int64) {
 		return
 	}
 	if result.RowsAffected > 0 {
-		RefreshAccessDataCaches()
-		rebuildActiveFilterOptions(version)
+		InvalidateIncrementalSnapshotCaches(version, ids)
 	}
 }
 
@@ -420,8 +437,8 @@ func UpsertActiveSnapshotsByMids(mids ...int64) (string, int, error) {
 		return version, 0, nil
 	}
 
-	allSnapshots := make([]model.FilmListSnapshot, 0, len(ids))
-	allDeletedMIDs := make([]int64, 0)
+	updatedCount := 0
+	deletedCount := 0
 	processed := 0
 	if err := db.Mdb.Transaction(func(tx *gorm.DB) error {
 		for _, batchIDs := range chunkSnapshotMIDs(ids, snapshotBuildBatchSize) {
@@ -463,8 +480,8 @@ func UpsertActiveSnapshotsByMids(mids ...int64) (string, int, error) {
 			}
 			writeCost := time.Since(writeStartedAt)
 
-			allSnapshots = append(allSnapshots, batchSnapshots...)
-			allDeletedMIDs = append(allDeletedMIDs, deletedMIDs...)
+			updatedCount += len(batchSnapshots)
+			deletedCount += len(deletedMIDs)
 			processed += len(batchIDs)
 			log.Printf(
 				"[Snapshot] 快速增量发布进度 version=%s mid=%d/%d batch=%d updated=%d deleted=%d query=%s build=%s write=%s cost=%s total_cost=%s",
@@ -487,14 +504,15 @@ func UpsertActiveSnapshotsByMids(mids ...int64) (string, int, error) {
 	}
 
 	applyStartedAt := time.Now()
-	if err := ApplyActiveFilmReadModelSnapshots(version, allSnapshots, allDeletedMIDs); err != nil {
+	if err := ApplyActiveFilmReadModelSnapshots(version, nil, nil); err != nil {
 		return "", 0, err
 	}
+	InvalidateIncrementalSnapshotCaches(version, ids)
 	applyCost := time.Since(applyStartedAt)
 	RefreshAccessDataCaches()
 	ClearAdminFilmSearchCache()
-	log.Printf("[Snapshot] 快速增量发布完成 version=%s input=%d updated=%d deleted=%d apply=%s total_cost=%s", version, len(ids), len(allSnapshots), len(allDeletedMIDs), applyCost, time.Since(startedAt))
-	return version, len(allSnapshots), nil
+	log.Printf("[Snapshot] 快速增量发布完成 version=%s input=%d updated=%d deleted=%d apply=%s total_cost=%s", version, len(ids), updatedCount, deletedCount, applyCost, time.Since(startedAt))
+	return version, updatedCount, nil
 }
 
 func chunkSnapshotMIDs(ids []int64, size int) [][]int64 {
@@ -558,7 +576,10 @@ func diffMIDs(all []int64, kept []int64) []int64 {
 
 func GetSnapshotByMid(version string, mid int64) *model.FilmListSnapshot {
 	version = strings.TrimSpace(version)
-	if version == "" || mid <= 0 {
+	if version == "" {
+		version = GetActiveSnapshotVersion()
+	}
+	if version == "" || mid <= 0 || db.Mdb == nil {
 		return nil
 	}
 	var snapshot model.FilmListSnapshot
@@ -571,6 +592,9 @@ func GetSnapshotByMid(version string, mid int64) *model.FilmListSnapshot {
 // GetSnapshotsByMidsOrdered 按 mid 列表顺序取当前版本快照；无快照的 mid 跳过。
 func GetSnapshotsByMidsOrdered(version string, mids []int64) []model.FilmListSnapshot {
 	version = strings.TrimSpace(version)
+	if version == "" {
+		version = GetActiveSnapshotVersion()
+	}
 	if version == "" || len(mids) == 0 || db.Mdb == nil {
 		return nil
 	}
@@ -697,6 +721,10 @@ func GetSnapshotHotMovieListByCategory(version string, field string, id int64, l
 	return GetSnapshotHotMovieListByCategoryReadModel(version, field, id, limit, offset)
 }
 
+func GetSnapshotDynamicHotMovieListByCategory(version string, field string, id int64, limit int, poolSize int) []model.MovieBasicInfo {
+	return GetSnapshotDynamicHotMovieListByCategoryReadModel(version, field, id, limit, poolSize)
+}
+
 func GetSnapshotMovieListBySort(version string, sortType int, pid int64, page *dto.Page) []model.MovieBasicInfo {
 	return GetSnapshotMovieListBySortReadModel(version, sortType, pid, page)
 }
@@ -717,6 +745,50 @@ func RefreshAccessDataCaches() {
 	)
 	bumpSearchTagsCacheVersion()
 	clearCachePatterns(
+		fmt.Sprintf("%s*", config.IndexPageCacheKey),
+		fmt.Sprintf("%s:*", config.TVBoxList),
+		fmt.Sprintf("%s:*", config.TVBoxNetworkConfigCacheKey),
+		fmt.Sprintf("%s:*", config.FilmClassifyCacheKey),
+		fmt.Sprintf("%s:*", config.SearchTags),
+		"EcoHub:filter_option:*",
+	)
+}
+
+// InvalidateIncrementalSnapshotCaches 增量快照发布后精准淘汰列表/播放缓存，并重置内存搜索索引。
+// 严禁调用 ClearActiveFilmReadModel：防止 Version 被置空导致全站播放详情失败。
+func InvalidateIncrementalSnapshotCaches(version string, mids []int64) {
+	support.ClearIndexPageCache()
+	ClearProvideListCache()
+	version = strings.TrimSpace(version)
+	if version == "" {
+		version = GetActiveSnapshotVersion()
+	}
+	InvalidateActiveFilmSearchIndex(version)
+	if db.Rdb != nil && len(mids) > 0 {
+		// 精准批量删除被修改影片的详情与播放页缓存
+		pipe := db.Rdb.Pipeline()
+		for _, mid := range mids {
+			pipe.Del(db.Cxt, fmt.Sprintf("EcoHub:filmPlayInfo:%d", mid))
+		}
+		_, _ = pipe.Exec(db.Cxt)
+	}
+}
+
+func ClearAllSnapshotDynamicCaches() {
+	support.ClearIndexPageCache()
+	ClearActiveFilmReadModel()
+	clearCachePatterns(
+		"EcoHub:snap_cat:*",
+		"EcoHub:snap_cat_page:*",
+		"EcoHub:snap_hot:*",
+		"EcoHub:snap_hot_pool:*",
+		"EcoHub:snap_sort:*",
+		"EcoHub:tags_search:*",
+		"EcoHub:provide:*",
+		"EcoHub:search:*",
+		"EcoHub:related:*",
+		"EcoHub:relate:*",
+		"EcoHub:Index:Page:*",
 		fmt.Sprintf("%s*", config.IndexPageCacheKey),
 		fmt.Sprintf("%s:*", config.TVBoxList),
 		fmt.Sprintf("%s:*", config.TVBoxNetworkConfigCacheKey),

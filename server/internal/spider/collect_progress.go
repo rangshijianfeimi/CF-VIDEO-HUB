@@ -6,7 +6,6 @@ import (
 	"sync"
 	"time"
 
-	"server/internal/infra/syslog"
 	"server/internal/model"
 	"server/internal/repository"
 	filmrepo "server/internal/repository/film"
@@ -270,6 +269,7 @@ func shouldWrapUpAfterFetchAbort(success int, skipPublish bool) bool {
 
 func StopTask(sourceID string) {
 	markProgressStopped(sourceID)
+	collectWrites.cancelSource(model.SlaveCollect, sourceID)
 	if val, ok := activeTasks.Load(sourceID); ok {
 		val.(collectTask).cancel()
 	}
@@ -409,18 +409,12 @@ func StopAllTasks() {
 		}
 		if id, ok := key.(string); ok {
 			markProgressStopped(id)
+			collectWrites.cancelSource(model.SlaveCollect, id)
 		}
 		return true
 	})
 	if count > 0 {
 		log.Printf("[Spider] 已强制停止 %d 个活跃采集任务\n", count)
-		go finalizeStoppedCollectTasks()
-	}
-}
-
-func finalizeStoppedCollectTasks() {
-	if err := collectLifecycle.flushPending(); err != nil {
-		syslog.Errorf("[Spider] 终止采集后收尾刷新失败: %v", err)
 	}
 }
 

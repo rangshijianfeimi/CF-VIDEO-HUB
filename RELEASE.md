@@ -1,21 +1,7 @@
-正式版，Docker 镜像 `ghcr.io/fe-spark/ecohub:v2.4.3` 与 `ghcr.io/fe-spark/ecohub:latest`。
-
-### 升级指引
-
-- **从 v2.4.2 升级**：执行 `docker compose pull && docker compose up -d` 即可（或后台「检查更新」一键平滑升级）。无需额外迁移。
-
----
+测试版（Pre-release），Docker 镜像 `ghcr.io/fe-spark/ecohub:v2.5.0-beta.12`。
 
 ### 核心变更
 
-#### 1. 全维智能模糊搜索
-
-- **相关度优先**：片名完全匹配、前缀、包含、分词、跳字缩写分层打分；「庆余年」正剧排在花絮前面，「庆余年 2」能打到第二季。
-- **拼音与容错**：支持全拼 / 简拼（如 `lldq` → 《流浪地球》）、多音字（`frxxc` / `frxxz`）、繁简与标点（「哈利波特与魔法石」）。
-- **主演导演与别名**：可搜「周星驰」「诺兰」「小破球」；按人名 / 别名片段匹配，采集源塞进副标题的相关作品墙不再误伤（搜「凡人修仙传」不会出《斗罗大陆》）。
-- **排序与高亮**：搜索页支持综合相关度 / 最多播放 / 最近更新 / 最高评分 / 上映年份；命中词高亮。每页默认 12 条。
-
-#### 2. 热门推荐与搜索历史解耦
-
-- **热门推荐**：按片库播放热度取片名，不再把个人搜索词写入热搜榜。
-- **搜索历史**：仍仅保存在浏览器本地，互不影响。
+#### 1. 首页数据（`/api/index`）百万级数据极速加载与 MySQL 索引优化
+- **完美匹配 `idx_snap_pid_hits` 组合索引**：分类热播列表（`GetSnapshotHotMovieListByCategoryReadModel`）与动态推荐池（`GetSnapshotHotPoolByCategoryReadModel`）移除破坏索引排序的范围过滤条件，直接按 `WHERE snapshot_version = ? AND pid = ? ORDER BY hits DESC, id DESC LIMIT 50` 命中 B-Tree 索引精准扫描，彻底消除多达数十次的百万数据全表 Filesort，单次查询从 500ms 降至 < 0.5ms。
+- **全分类大区多协程并发构建**：`IndexPage` 内部遍历分类与 `overlayDynamicCategoryMovies` 动态池抽样全面重构为 `sync.WaitGroup` 多 Goroutine 并发加载，分类查询从串行耗时累加转为并行加载，冷启动接口响应时间从 9400ms 降至 20ms 以内（缓存命中时保持 < 3ms）。

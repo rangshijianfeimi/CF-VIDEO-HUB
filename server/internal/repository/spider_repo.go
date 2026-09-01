@@ -334,15 +334,23 @@ func DelCollectResource(id string) error {
 			return err
 		}
 		// 2. 删除附属站播放列表
-		if err := tx.Where("source_id = ?", id).Delete(&model.MoviePlaylist{}).Error; err != nil {
+		if err := tx.Where("source_id = ?", id).Unscoped().Delete(&model.MoviePlaylist{}).Error; err != nil {
 			return err
 		}
-		// 3. 删除采集失败记录
+		// 3. 删除附属站海报图源数据
+		if err := tx.Where("source_id = ?", id).Unscoped().Delete(&model.MoviePoster{}).Error; err != nil {
+			return err
+		}
+		// 4. 删除采集失败记录
 		if err := DeleteFailureRecordsByOriginIdTx(tx, id); err != nil {
 			return err
 		}
-		// 4. 删除采集站本身
-		return tx.Where("id = ?", id).Delete(&model.FilmSource{}).Error
+		// 5. 删除采集站本身
+		if err := tx.Where("id = ?", id).Delete(&model.FilmSource{}).Error; err != nil {
+			return err
+		}
+		// 6. 若删除的站点是当前海报源，自动兜底将主站恢复为海报源
+		return EnsureDefaultPosterSourceTx(tx)
 	})
 }
 
@@ -352,6 +360,9 @@ func AddCollectSource(s model.FilmSource) error {
 }
 
 func AddCollectSourceTx(tx *gorm.DB, s model.FilmSource) error {
+	if tx == nil {
+		return errors.New("database transaction is nil")
+	}
 	var count int64
 	if err := tx.Model(&model.FilmSource{}).Where("uri = ?", s.Uri).Count(&count).Error; err != nil {
 		return err
@@ -363,8 +374,24 @@ func AddCollectSourceTx(tx *gorm.DB, s model.FilmSource) error {
 	if s.Id == "" {
 		s.Id = utils.GenerateHashKey(s.Uri)
 	}
+	// 主站若无外部指定且无活跃海报源，默认作为海报源
+	if s.Grade == model.MasterCollect && !s.IsPosterSource {
+		var activePosterCount int64
+		if err := tx.Model(&model.FilmSource{}).Where("is_poster_source = ? AND state = ?", true, true).Count(&activePosterCount).Error; err == nil && activePosterCount == 0 {
+			s.IsPosterSource = true
+			log.Printf("[Spider] 主站无活跃海报源，自动设为默认海报图源: id=%s name=%s", s.Id, s.Name)
+		}
+	}
 	normalizeCollectSourceDefaults(&s)
-	return tx.Create(&s).Error
+	if s.IsPosterSource {
+		if err := DemoteExistingPosterSourceTx(tx, s.Id); err != nil {
+			return err
+		}
+	}
+	if err := tx.Create(&s).Error; err != nil {
+		return err
+	}
+	return EnsureDefaultPosterSourceTx(tx)
 }
 
 // BatchAddCollectSource 批量添加采集站信息
@@ -385,6 +412,9 @@ func UpdateCollectSource(s model.FilmSource) error {
 }
 
 func UpdateCollectSourceTx(tx *gorm.DB, s model.FilmSource) error {
+	if tx == nil {
+		return errors.New("database transaction is nil")
+	}
 	var count int64
 	if err := tx.Model(&model.FilmSource{}).Where("id != ? AND uri = ?", s.Id, s.Uri).Count(&count).Error; err != nil {
 		return err
@@ -393,7 +423,15 @@ func UpdateCollectSourceTx(tx *gorm.DB, s model.FilmSource) error {
 		return errors.New("当前采集站链接已存在其他站点中，请勿重复添加")
 	}
 	normalizeCollectSourceDefaults(&s)
-	return tx.Save(&s).Error
+	if s.IsPosterSource {
+		if err := DemoteExistingPosterSourceTx(tx, s.Id); err != nil {
+			return err
+		}
+	}
+	if err := tx.Save(&s).Error; err != nil {
+		return err
+	}
+	return EnsureDefaultPosterSourceTx(tx)
 }
 
 // DemoteExistingMaster 将现有的主站降级为附属站，确保全局仅一个主站
@@ -402,9 +440,59 @@ func DemoteExistingMaster() error {
 }
 
 func DemoteExistingMasterTx(tx *gorm.DB) error {
+	if tx == nil {
+		return nil
+	}
 	return tx.Model(&model.FilmSource{}).
 		Where("grade = ?", model.MasterCollect).
 		Update("grade", model.SlaveCollect).Error
+}
+
+// GetPosterSource 获取当前启用的优先海报图源站：
+// 优先取显式标记 is_poster_source = true AND state = true 的站点；
+// 若无显式开启海报源的站点，自动兜底取当前活跃的主站。
+func GetPosterSource() *model.FilmSource {
+	if db.Mdb == nil {
+		return nil
+	}
+	var fs model.FilmSource
+	if err := db.Mdb.Where("is_poster_source = ? AND state = ?", true, true).First(&fs).Error; err == nil {
+		normalizeCollectCd(&fs)
+		return &fs
+	}
+	// 兜底：取活跃主站
+	if err := db.Mdb.Where("grade = ? AND state = ?", model.MasterCollect, true).First(&fs).Error; err == nil {
+		normalizeCollectCd(&fs)
+		return &fs
+	}
+	return nil
+}
+
+// EnsureDefaultPosterSourceTx 确保全局至少有一个活跃海报图源（无外部海报源时将主站设为海报源）
+func EnsureDefaultPosterSourceTx(tx *gorm.DB) error {
+	if tx == nil {
+		return nil
+	}
+	var count int64
+	if err := tx.Model(&model.FilmSource{}).Where("is_poster_source = ? AND state = ?", true, true).Count(&count).Error; err != nil {
+		return err
+	}
+	if count == 0 {
+		var activeMasterCount int64
+		if err := tx.Model(&model.FilmSource{}).Where("grade = ? AND state = ?", model.MasterCollect, true).Count(&activeMasterCount).Error; err == nil && activeMasterCount > 0 {
+			return tx.Model(&model.FilmSource{}).Where("grade = ? AND state = ?", model.MasterCollect, true).Update("is_poster_source", true).Error
+		}
+	}
+	return nil
+}
+
+// DemoteExistingPosterSourceTx 互斥单海报源：将其他站点的 is_poster_source 设为 false
+func DemoteExistingPosterSourceTx(tx *gorm.DB, exceptID string) error {
+	query := tx.Model(&model.FilmSource{}).Where("is_poster_source = ?", true)
+	if strings.TrimSpace(exceptID) != "" {
+		query = query.Where("id <> ?", exceptID)
+	}
+	return query.Update("is_poster_source", false).Error
 }
 
 // ClearAllCollectSource 删除所有采集站信息
