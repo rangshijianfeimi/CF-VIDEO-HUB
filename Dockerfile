@@ -51,8 +51,7 @@ LABEL org.opencontainers.image.title="EcoHub All-in-One" \
 ENV NODE_ENV=production \
     NEXT_TELEMETRY_DISABLED=1 \
     TZ=Asia/Shanghai \
-    PORT=3000 \
-    SERVER_PORT=8080 \
+    PORT=8080 \
     API_URL=http://127.0.0.1:8080
 
 RUN apk add --no-cache ca-certificates tzdata supervisor
@@ -67,9 +66,12 @@ COPY --from=web-builder /app/public /app/web/public
 COPY --from=web-builder /app/.next/standalone /app/web/
 COPY --from=web-builder /app/.next/static /app/web/.next/static
 
-# Supervisord 进程配置
+# Supervisord 进程配置与启动脚本
 COPY supervisord.conf /etc/supervisord.conf
+COPY supervisord-worker.conf /etc/supervisord-worker.conf
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 3000 8080
 
-CMD ["/usr/bin/supervisord", "-c", "/etc/supervisord.conf"]
+ENTRYPOINT ["/app/entrypoint.sh"]

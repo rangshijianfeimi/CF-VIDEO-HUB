@@ -152,7 +152,6 @@ services:
     image: ghcr.io/fe-spark/ecohub:latest
     restart: always
     environment:
-      PORT: ${SERVER_PORT:-8080}
       JWT_SECRET: ${JWT_SECRET:-ecohub_2026!local@dev_secret$$001}
       MYSQL_HOST: ${MYSQL_HOST:-mysql}
       MYSQL_PORT: ${MYSQL_PORT:-3306}
@@ -169,8 +168,8 @@ services:
       ALL_PROXY: ${ALL_PROXY:-}
       COLLECT_PROFILE: ${COLLECT_PROFILE:-auto}
     ports:
-      - ${WEB_PUBLIC_PORT:-3000}:3000
-      - 0.0.0.0:${SERVER_PUBLIC_PORT:-18080}:${SERVER_PORT:-8080}
+      - ${WEB_PORT:-3000}:3000
+      - 0.0.0.0:${SERVER_PORT:-18080}:8080
     volumes:
       - ./data/uploads:/app/static/upload
       - /var/run/docker.sock:/var/run/docker.sock
@@ -199,9 +198,8 @@ networks:
 ### 2. Environment variables
 
 ```env
-WEB_PUBLIC_PORT=3000
-SERVER_PUBLIC_PORT=18080
-SERVER_PORT=8080
+WEB_PORT=3000
+SERVER_PORT=18080
 
 JWT_SECRET=replace-with-a-long-random-string
 
@@ -220,7 +218,7 @@ REDIS_DB=0
 
 - Bundled databases: `MYSQL_HOST=mysql` / `REDIS_HOST=redis`. Do not write `127.0.0.1`.
 - Release image does **not** need `API_URL`.
-- If the port is taken, change `WEB_PUBLIC_PORT` and match the reverse proxy.
+- If the port is taken, change `WEB_PORT` and match the reverse proxy.
 
 ### 3. Start
 
@@ -228,12 +226,15 @@ Save → start. Confirm `Eco-hub`, `Eco-mysql`, and `Eco-redis` are running. URL
 
 You can also run the install script first, then inspect / take over the stack in 1Panel’s container list.
 
-### 4. Website and HTTPS
+### 4. Website, HTTPS, and Avoiding Public Port Exposure
 
-1. **Website** → **Create site** → **Reverse proxy** → `http://127.0.0.1:3000` (or your `WEB_PUBLIC_PORT`).
+1. **Website** → **Create site** → **Reverse proxy** → `http://127.0.0.1:3000` (or your `WEB_PORT`).
 2. Issue Let’s Encrypt or upload a cert, enable HTTPS.
 3. Do **not** point `/api/*` at `18080` by itself. Send the whole site through `3000`; Next inside the container forwards to Go.
-4. Open `80`/`443` on the firewall. Do **not** expose `18080`, MySQL, or Redis to the public internet.
+4. **Avoid exposing raw ports to the public internet (Recommended)**:
+   - Docker’s default iptables rules bypass system firewalls (like UFW). To **prevent direct public access to port 3000**, explicitly bind `127.0.0.1:` in `compose.yml` (e.g. `127.0.0.1:${WEB_PORT:-3000}:3000`), so only the local reverse proxy can reach it.
+   - If direct player access is not needed, comment out or remove the `18080:8080` port mapping.
+   - Open `80`/`443` on the firewall. Do **not** expose `18080`, MySQL, or Redis to the public internet.
 
 ### 5. Update
 
@@ -313,11 +314,66 @@ Logs: `docker logs -f Eco-hub`. To update: `docker pull ghcr.io/fe-spark/ecohub:
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `WEB_PUBLIC_PORT` | `3000` | Site and admin |
-| `SERVER_PUBLIC_PORT` | `18080` | Direct API mapping |
-| `SERVER_PORT` | `8080` | Go listen port inside the container (injected as `PORT`) |
+| `WEB_PORT` | `3000` | Host Web access port |
+| `SERVER_PORT` | `18080` | Host direct API access port (optional) |
 
-In production, expose only the Web port (or 80/443 behind a reverse proxy).
+In production, expose only the Web port (or 80/443 behind a reverse proxy). To **completely prevent direct public access to raw ports**, set the port mapping in `compose.yml` to `127.0.0.1:${WEB_PORT:-3000}:3000`, making it accessible only via the local host and reverse proxy.
+
+---
+
+## Cluster & Multi-Node Deployment (`CLUSTER_ROLE`)
+
+When deploying across multiple VPS nodes for load balancing and high concurrency, specify node roles via environment variables:
+- `CLUSTER_ROLE=master` (Default): Master node, runs both Next.js Web and Go backend, handles management, database writes, and scheduled collect jobs (Cron).
+- `CLUSTER_ROLE=worker`: Read-only replica, **runs as a pure Go API instance (automatically skips the Next.js Web process to save substantial memory and disables the scheduled collect scheduler)**, dedicated to handling high-concurrency TVBox, YingShiCang, MacCMS, and public API traffic.
+- **Reverse Proxy (Nginx) Best Practices**:
+  - Route public web page browsing (`/`) and administration UI/APIs (`/manage`, `/api/manage/*`) strictly to the Master node (file uploads are handled under `/api/manage/file/upload` and naturally covered by this rule).
+  - High-concurrency read-only APIs and static poster image reads (`/api/`, including `/api/upload/pic/poster/`) should be distributed across the cluster load balancer (shared by Master and Worker nodes).
+  - **Nginx Configuration Example**:
+    ```nginx
+    upstream eco_cluster_api {
+        server 192.168.1.10:8080 weight=1; # Master Node API
+        server 192.168.1.11:8080 weight=2; # Worker 1 Node API
+        server 192.168.1.12:8080 weight=2; # Worker 2 Node API
+    }
+
+    upstream eco_master_web {
+        server 192.168.1.10:3000;          # Master Web frontend
+    }
+
+    upstream eco_master_api {
+        server 192.168.1.10:8080;          # Master API (writes and management)
+    }
+
+    server {
+        listen 80;
+        server_name your-domain.com;
+
+        # Administration UI routed to Master
+        location /manage {
+            proxy_pass http://eco_master_web;
+        }
+
+        # Administration write/upload APIs routed to Master
+        location /api/manage/ {
+            proxy_pass http://eco_master_api;
+        }
+
+        # High-concurrency read-only APIs and static poster images load balanced across cluster
+        location /api/ {
+            proxy_pass http://eco_cluster_api;
+        }
+
+        # Default web browsing requests routed to Master Web
+        location / {
+            proxy_pass http://eco_master_web;
+        }
+    }
+    ```
+- **Deployment order & data sync notes**:
+  - **Start Master first, then scale Workers**: Workers poll Redis for the snapshot version/revision every 3s and auto-align with the Master's read model and search index; if Master has not yet published the first snapshot, Workers load it automatically once it appears — no restart needed.
+  - **Share persistent storage**: snapshot data and static assets live in the database/shared disk; Workers must be able to read Master's snapshot data (e.g. `film_list_snapshot`). Mount `data/` on shared storage (NFS / cloud disk) and do not give Workers an empty database.
+  - **Workers are read-only at the application layer**: write endpoints under `/api/manage/*` (including uploads) are rejected directly by the backend (HTTP 403). Reverse-proxy routing is only the first layer of protection — defense in depth against accidental writes.
 
 ---
 

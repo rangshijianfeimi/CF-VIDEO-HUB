@@ -152,7 +152,6 @@ services:
     image: ghcr.io/fe-spark/ecohub:latest
     restart: always
     environment:
-      PORT: ${SERVER_PORT:-8080}
       JWT_SECRET: ${JWT_SECRET:-ecohub_2026!local@dev_secret$$001}
       MYSQL_HOST: ${MYSQL_HOST:-mysql}
       MYSQL_PORT: ${MYSQL_PORT:-3306}
@@ -169,8 +168,8 @@ services:
       ALL_PROXY: ${ALL_PROXY:-}
       COLLECT_PROFILE: ${COLLECT_PROFILE:-auto}
     ports:
-      - ${WEB_PUBLIC_PORT:-3000}:3000
-      - 0.0.0.0:${SERVER_PUBLIC_PORT:-18080}:${SERVER_PORT:-8080}
+      - ${WEB_PORT:-3000}:3000
+      - 0.0.0.0:${SERVER_PORT:-18080}:8080
     volumes:
       - ./data/uploads:/app/static/upload
       - /var/run/docker.sock:/var/run/docker.sock
@@ -199,9 +198,8 @@ networks:
 ### 2. 环境变量
 
 ```env
-WEB_PUBLIC_PORT=3000
-SERVER_PUBLIC_PORT=18080
-SERVER_PORT=8080
+WEB_PORT=3000
+SERVER_PORT=18080
 
 JWT_SECRET=请替换为长随机串
 
@@ -220,7 +218,7 @@ REDIS_DB=0
 
 - 内置库：`MYSQL_HOST=mysql` / `REDIS_HOST=redis`，不要写成 `127.0.0.1`。  
 - 发布版 **无需** `API_URL`。  
-- 端口占用时改 `WEB_PUBLIC_PORT`，反代同步改。
+- 端口占用时改 `WEB_PORT`，反代同步改。
 
 ### 3. 启动
 
@@ -228,12 +226,15 @@ REDIS_DB=0
 
 也可先跑安装脚本，再在 1Panel 容器列表中查看/接管。
 
-### 4. 网站与 HTTPS
+### 4. 网站、HTTPS 与不对外开放裸端口
 
-1. **网站** → **创建网站** → **反向代理** → `http://127.0.0.1:3000`（或你的 `WEB_PUBLIC_PORT`）。  
+1. **网站** → **创建网站** → **反向代理** → `http://127.0.0.1:3000`（或你的 `WEB_PORT`）。  
 2. 申请 Let's Encrypt 或上传证书，开启 HTTPS。  
 3. `/api/*` **不要**单独指到 `18080`；整站走 `3000`，由容器内 Next 转发到 Go。  
-4. 防火墙放行 `80`/`443`；**不要**公网放行 `18080`、MySQL、Redis。
+4. **不对外开放裸端口（安全推荐）**：
+   - Docker 默认规则会穿透系统防火墙（如 UFW）。若要**禁止公网直接访问 3000 端口**，请在 `compose.yml` 中显式指定 `127.0.0.1:` 绑定（如 `127.0.0.1:${WEB_PORT:-3000}:3000`），此时公网无法直连，仅本机反向代理可用；
+   - 若无播放器直连需求，直接在 `compose.yml` 中注释或删除 `18080:8080` 端口映射；
+   - 防火墙放行 `80`/`443`；**不要**公网放行 `18080`、MySQL、Redis。
 
 ### 5. 更新
 
@@ -313,11 +314,66 @@ docker run -d --name Eco-hub --restart always --network Eco-network \
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `WEB_PUBLIC_PORT` | `3000` | 前台与后台入口 |
-| `SERVER_PUBLIC_PORT` | `18080` | 后端直连映射 |
-| `SERVER_PORT` | `8080` | 容器内 Go 监听（注入为 `PORT`） |
+| `WEB_PORT` | `3000` | 宿主机 Web 访问入口端口 |
+| `SERVER_PORT` | `18080` | 宿主机后端直连映射端口（可选） |
 
-生产建议只暴露 Web 端口（或反代后的 80/443）。
+生产建议只暴露 Web 端口（或反代后的 80/443）。如需**完全禁止外部直连裸端口**，请在 `compose.yml` 中将端口映射写为 `127.0.0.1:${WEB_PORT:-3000}:3000`，使端口仅限本机及 1Panel / Nginx 反向代理访问。
+
+---
+
+## 集群部署与多节点（CLUSTER_ROLE）
+
+多台 VPS 搭建集群以分流抗高并发时，可通过环境变量指定节点角色：
+- `CLUSTER_ROLE=master`（默认）：主控节点，同时运行 Next.js Web 与 Go 后端，负责后台管理、写库及定时采集任务；
+- `CLUSTER_ROLE=worker`：从属读节点，**专职作为纯 Go API 节点运行（自动跳过 Next.js Web 进程以节约大量内存，同时自动禁用定时采集调度器）**，专为 TVBox、影视仓、MacCMS 与前台 API 提供海量高并发读服务；
+- **反向代理（Nginx）最佳实践**：
+  - 前台网页浏览（`/`）与管理后台（`/manage`、`/api/manage/*`）固定打到 Master 节点（后台素材上传已收敛在 `/api/manage/file/upload`，已被该规则自然覆盖）；
+  - 高并发只读 API 与海报静态图片读请求（`/api/`，含 `/api/upload/pic/poster/`）分流到集群负载均衡（由 Master 与多个 Worker 共同抗压）；
+  - **Nginx 配置示例**：
+    ```nginx
+    upstream eco_cluster_api {
+        server 192.168.1.10:8080 weight=1; # Master 节点 API
+        server 192.168.1.11:8080 weight=2; # Worker 1 节点 API
+        server 192.168.1.12:8080 weight=2; # Worker 2 节点 API
+    }
+
+    upstream eco_master_web {
+        server 192.168.1.10:3000;          # Master Web 页面
+    }
+
+    upstream eco_master_api {
+        server 192.168.1.10:8080;          # Master API（写操作与管理后台）
+    }
+
+    server {
+        listen 80;
+        server_name your-domain.com;
+
+        # 管理后台前端页面固定路由至 Master
+        location /manage {
+            proxy_pass http://eco_master_web;
+        }
+
+        # 管理后台写/改/配置/上传接口固定路由至 Master
+        location /api/manage/ {
+            proxy_pass http://eco_master_api;
+        }
+
+        # 高并发前台只读 API 及海报静态素材（/api/upload/pic/poster/）由 Master 与 Worker 集群共同分流负载
+        location /api/ {
+            proxy_pass http://eco_cluster_api;
+        }
+
+        # 默认网页浏览请求打到 Master Web
+        location / {
+            proxy_pass http://eco_master_web;
+        }
+    }
+    ```
+- **部署顺序与数据同步注意事项**：
+  - **先启动 Master，再扩容 Worker**：Worker 启动后每 3s 轮询 Redis 中的快照版本/修订号自动对齐 Master 的读模型与搜索索引；若 Master 尚未完成首次快照发布，Worker 会在首个快照发布后自动装载，无需重启。
+  - **共享持久化数据卷**：快照表与静态资源存放在数据库/共享磁盘，Worker 必须能读取 Master 写入的快照数据（`film_list_snapshot` 等），建议将 `data/` 挂载为共享存储（如 NFS / 云盘），不要为 Worker 单独建空库。
+  - **Worker 为应用层只读节点**：Worker 上 `/api/manage/*`（含上传）等写接口会被后端直接拒绝（HTTP 403），反向代理路由仅是第一层约束，双重防护避免误写。
 
 ---
 

@@ -22,13 +22,37 @@ export interface HeroBannerItem {
   poster?: string;
   picture: string;
   pictureSlide?: string;
-  year: string;
-  cName: string;
+  year?: string | number;
+  cName?: string;
   area?: string;
+  classTag?: string;
+  actor?: string;
+  director?: string;
   remark?: string;
   remarks?: string;
   blurb?: string;
   score?: string | number;
+  hits?: number;
+}
+
+function parseClassTags(classTag?: any, limit = 1): string[] {
+  return String(classTag || "").split(/[,/，\s]+/).filter(Boolean).slice(0, limit);
+}
+
+function resolveQualityBadge(remarks?: any): string {
+  const text = String(remarks || "").toUpperCase();
+  if (text.includes("4K")) return "4K 超清";
+  if (text.includes("1080")) return "1080P";
+  if (text.includes("HD")) return "HD 高清";
+  return "4K 超清";
+}
+
+function resolveHeroSummary(item: HeroBannerItem): string {
+  if (item.blurb) return String(item.blurb).trim();
+  if (item.director || item.actor) {
+    return [item.director && `导演：${item.director}`, item.actor && `主演：${item.actor}`].filter(Boolean).join(" · ");
+  }
+  return `热播精选《${item.name || "影视"}》，高清流畅播放，点击立即畅享精彩正片。`;
 }
 
 function getBackdrop(item: HeroBannerItem) {
@@ -162,12 +186,13 @@ export default function HomeHero({ banners }: { banners: HeroBannerItem[] }) {
               {active.cName ? (
                 <span className={styles.chip}>{active.cName}</span>
               ) : null}
-              {active.score ? (
-                <span className={styles.badgeRating}>★ {active.score}</span>
-              ) : (
-                <span className={styles.badgeRating}>★ 9.6</span>
-              )}
-              <span className={styles.badgeQuality}>4K 超清</span>
+              <span className={styles.badgeFeatured}>✨ 精选推荐</span>
+              {active.score && Number(active.score) > 0 ? (
+                <span className={styles.badgeRating}>★ {Number(active.score).toFixed(1)}</span>
+              ) : null}
+              <span className={styles.badgeQuality}>
+                {resolveQualityBadge(active.remarks || active.remark)}
+              </span>
               {multi ? (
                 <span className={styles.counter}>
                   {String(safeIndex + 1).padStart(2, "0")}
@@ -180,27 +205,27 @@ export default function HomeHero({ banners }: { banners: HeroBannerItem[] }) {
             <h2 className={styles.title}>{active.name}</h2>
 
             <div className={styles.tags}>
-              {active.year && active.year !== "0" ? (
-                <span className={styles.tag}>{active.year}</span>
-              ) : null}
               {active.cName ? (
-                <span className={styles.tag}>{active.cName}</span>
+                <span className={styles.tagCategory}>{active.cName}</span>
+              ) : null}
+              {active.score && Number(active.score) > 0 ? (
+                <span className={styles.tagRating}>★ {Number(active.score).toFixed(1)}</span>
+              ) : null}
+              {active.year && String(active.year) !== "0" ? (
+                <span className={styles.tag}>{String(active.year)}</span>
               ) : null}
               {active.area ? (
-                <span className={styles.tag}>{active.area}</span>
+                <span className={styles.tag}>{String(active.area)}</span>
               ) : null}
+              {parseClassTags(active.classTag, 1).map((tag) => (
+                <span key={tag} className={styles.tag}>{tag}</span>
+              ))}
               {active.remarks || active.remark ? (
-                <span className={styles.tagHighlight}>{active.remarks || active.remark}</span>
+                <span className={styles.tagHighlight}>{String(active.remarks || active.remark)}</span>
               ) : null}
             </div>
 
-            {active.blurb ? (
-              <p className={styles.blurb}>{active.blurb}</p>
-            ) : (
-              <p className={`${styles.blurb} ${styles.blurbFallback}`}>
-                震撼视觉体验，呈现高帧率全高清画面与纯正环绕声效，带您体验沉浸式观影之旅。
-              </p>
-            )}
+            <p className={styles.blurb}>{resolveHeroSummary(active)}</p>
 
             <Button
               type="primary"
@@ -297,9 +322,7 @@ export default function HomeHero({ banners }: { banners: HeroBannerItem[] }) {
                       className={styles.cardImg}
                       style={{ backgroundImage: `url(${getPoster(item)})` }}
                     />
-                    {item.cName ? (
-                      <span className={styles.cardChip}>{item.cName}</span>
-                    ) : null}
+                    <span className={styles.cardFeaturedBadge}>✨ 精选</span>
                   </button>
                 </SwiperSlide>
               ))}

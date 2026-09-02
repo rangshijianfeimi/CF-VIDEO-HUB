@@ -92,7 +92,12 @@ func (i *IndexService) IndexPage() map[string]any {
 		for idx, c := range tree.Children {
 			wg.Add(1)
 			go func(i int, cat *model.CategoryTree) {
-				defer wg.Done()
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("[IndexPage] 加载分类 %d 发生异常: %v", cat.Id, r)
+					}
+					wg.Done()
+				}()
 				var movies []model.MovieBasicInfo
 				var hotMovies []model.MovieBasicInfo
 				if cat.Children != nil {
@@ -217,7 +222,12 @@ func overlayDynamicCategoryMovies(version string, outInfo map[string]any) {
 		for i, section := range list {
 			wg.Add(1)
 			go func(idx int, sec map[string]any) {
-				defer wg.Done()
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("[overlayDynamicCategoryMovies] 抽样板块发生异常: %v", r)
+					}
+					wg.Done()
+				}()
 				newList[idx] = processDynamicRecommendSection(sec, version)
 			}(i, section)
 		}
@@ -229,7 +239,12 @@ func overlayDynamicCategoryMovies(version string, outInfo map[string]any) {
 		for i, rawSec := range list {
 			wg.Add(1)
 			go func(idx int, raw any) {
-				defer wg.Done()
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("[overlayDynamicCategoryMovies] 抽样板块发生异常: %v", r)
+					}
+					wg.Done()
+				}()
 				if secMap, ok := raw.(map[string]any); ok {
 					newList[idx] = processDynamicRecommendSection(secMap, version)
 				} else {
@@ -297,6 +312,27 @@ func overlayBannerLiveRemarks(banners model.Banners) model.Banners {
 		}
 		if snap.Remarks != "" {
 			out[i].Remark = snap.Remarks
+		}
+		if snap.Area != "" {
+			out[i].Area = snap.Area
+		}
+		if snap.ClassTag != "" {
+			out[i].ClassTag = snap.ClassTag
+		}
+		if snap.Actor != "" {
+			out[i].Actor = snap.Actor
+		}
+		if snap.Director != "" {
+			out[i].Director = snap.Director
+		}
+		if snap.Blurb != "" {
+			out[i].Blurb = snap.Blurb
+		}
+		if snap.Score > 0 {
+			out[i].Score = snap.Score
+		}
+		if snap.Hits > 0 {
+			out[i].Hits = snap.Hits
 		}
 		// 核心优先级：若该轮播项已由管理员手动自定义修改 (IsCustomPic == true)，严格展示用户的自定义图片（优先 CustomPicture，兼容历史 Picture 字段）
 		customPic := strings.TrimSpace(out[i].CustomPicture)
