@@ -325,24 +325,29 @@ In production, expose only the Web port (or 80/443 behind a reverse proxy). To *
 
 When deploying across multiple VPS nodes for load balancing and high concurrency, specify node roles via environment variables:
 - `CLUSTER_ROLE=master` (Default): Master node, runs both Next.js Web and Go backend, handles management, database writes, and scheduled collect jobs (Cron).
-- `CLUSTER_ROLE=worker`: Read-only replica, **runs as a pure Go API instance (automatically skips the Next.js Web process to save substantial memory and disables the scheduled collect scheduler)**, dedicated to handling high-concurrency TVBox, YingShiCang, MacCMS, and public API traffic.
+- `CLUSTER_ROLE=worker`: Read-only replica, dedicated to handling high-concurrency TVBox, YingShiCang, MacCMS, and public API traffic (automatically disables scheduled collectors, skips Redis cache purges, and syncs snapshots via Redis Pub/Sub; also runs Next.js Web process, naturally enabling active-active load balancing and seamless zero-downtime failover);
 - **Reverse Proxy (Nginx) Best Practices**:
-  - Route public web page browsing (`/`) and administration UI/APIs (`/manage`, `/api/manage/*`) strictly to the Master node (file uploads are handled under `/api/manage/file/upload` and naturally covered by this rule).
-  - High-concurrency read-only APIs and static poster image reads (`/api/`, including `/api/upload/pic/poster/`) should be distributed across the cluster load balancer (shared by Master and Worker nodes).
-  - **Nginx Configuration Example**:
+  - **Public Web Browsing (`/`)**: Recommended **Active-Active load balancing mode** (Master and Workers share web rendering and search traffic based on weights), paired with `proxy_next_upstream` so all traffic automatically fails over to Workers if Master restarts, achieving both **multiplied capacity and zero downtime** (or mark Workers as `backup` if cold standby is preferred).
+  - **Administration UI and write APIs (`/manage`, `/api/manage/*`)**: Strictly routed to the Master node.
+  - **Custom Uploaded Assets (`/api/upload/`)**: Strictly routed to the Master node (logos and custom banners live on Master disk; this allows **Worker nodes to operate 100% statelessly without complex NFS mounts**).
+  - **High-concurrency read-only APIs (`/api/`)**: Load balanced across Master and Worker nodes (TVBox, YingShiCang, and public search/browse queries).
+  - **Nginx Configuration Example (Active-Active Load Balancing + Zero-Downtime Failover)**:
     ```nginx
+    # 1. Public API cluster (Master & Workers load balanced)
     upstream eco_cluster_api {
-        server 192.168.1.10:8080 weight=1; # Master Node API
-        server 192.168.1.11:8080 weight=2; # Worker 1 Node API
-        server 192.168.1.12:8080 weight=2; # Worker 2 Node API
+        server 192.168.1.10:8080 weight=1 max_fails=2 fail_timeout=5s; # Master Node API
+        server 192.168.1.11:8080 weight=2 max_fails=2 fail_timeout=5s; # Worker 1 Node API
+        server 192.168.1.12:8080 weight=2 max_fails=2 fail_timeout=5s; # Worker 2 Node API
     }
 
-    upstream eco_master_web {
-        server 192.168.1.10:3000;          # Master Web frontend
+    # 2. Public Web cluster (Active-Active mode; or add 'backup' to Workers for cold standby)
+    upstream eco_web_cluster {
+        server 192.168.1.10:3000 weight=1 max_fails=2 fail_timeout=5s; # Master Web frontend
+        server 192.168.1.11:3000 weight=2 max_fails=2 fail_timeout=5s; # Worker 1 Web frontend
     }
 
     upstream eco_master_api {
-        server 192.168.1.10:8080;          # Master API (writes and management)
+        server 192.168.1.10:8080;                                      # Master API (writes, management, and local uploads)
     }
 
     server {
@@ -351,7 +356,7 @@ When deploying across multiple VPS nodes for load balancing and high concurrency
 
         # Administration UI routed to Master
         location /manage {
-            proxy_pass http://eco_master_web;
+            proxy_pass http://192.168.1.10:3000;
         }
 
         # Administration write/upload APIs routed to Master
@@ -359,20 +364,36 @@ When deploying across multiple VPS nodes for load balancing and high concurrency
             proxy_pass http://eco_master_api;
         }
 
-        # High-concurrency read-only APIs and static poster images load balanced across cluster
-        location /api/ {
-            proxy_pass http://eco_cluster_api;
+        # Custom uploaded static assets (logos, banners stored on Master disk)
+        location /api/upload/ {
+            proxy_pass http://eco_master_api;
         }
 
-        # Default web browsing requests routed to Master Web
+        # High-concurrency read-only APIs load balanced across cluster
+        location /api/ {
+            proxy_pass http://eco_cluster_api;
+            proxy_next_upstream error timeout http_502 http_503 http_504;
+            proxy_connect_timeout 2s;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
+        # Default web browsing requests routed to web cluster (Active-Active load balanced, fails over if Master restarts)
         location / {
-            proxy_pass http://eco_master_web;
+            proxy_pass http://eco_web_cluster;
+            proxy_next_upstream error timeout http_502 http_503 http_504;
+            proxy_connect_timeout 2s;
+            proxy_read_timeout 15s;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         }
     }
     ```
 - **Deployment order & data sync notes**:
   - **Start Master first, then scale Workers**: Workers poll Redis for the snapshot version/revision every 3s and auto-align with the Master's read model and search index; if Master has not yet published the first snapshot, Workers load it automatically once it appears — no restart needed.
-  - **Share persistent storage**: snapshot data and static assets live in the database/shared disk; Workers must be able to read Master's snapshot data (e.g. `film_list_snapshot`). Mount `data/` on shared storage (NFS / cloud disk) and do not give Workers an empty database.
+  - **100% Stateless Worker deployment**: Snapshot data lives in the shared MySQL database (`film_list_snapshot` table) and syncs via Redis Pub/Sub; static uploads are served by Master via Nginx `/api/upload/`. Consequently, **Worker nodes do not need NFS mounts or local persistent volumes**, allowing instantaneous horizontal scaling.
   - **Workers are read-only at the application layer**: write endpoints under `/api/manage/*` (including uploads) are rejected directly by the backend (HTTP 403). Reverse-proxy routing is only the first layer of protection — defense in depth against accidental writes.
 
 ---
